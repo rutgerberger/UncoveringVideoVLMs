@@ -33,10 +33,10 @@ def init_args():
         help='The manual seed for experiments.')
 
     parser.add_argument(
-        '--mask_type',
+        '--insertion_mask_type',
         type=str,
-        default='black',
-        choices=['black','blur']
+        default='blur',
+        choices=['blur', 'constant']
     )
 
     parser.add_argument(
@@ -59,6 +59,13 @@ def init_args():
         type=bool,
         default=True,
         help='Calculate the lambda balancing scalar dynamically at Step 0 to balance insertion vs deletion.'
+    )
+
+    parser.add_argument(
+        '--save_visuals', 
+        type=lambda x: (str(x).lower() == 'true'), 
+        default=False
+        help='Whether or not to save visuals into the folder (for large scale experiment)'
     )
 
     parser.add_argument(
@@ -137,6 +144,13 @@ def init_args():
         type=float,
         default=0.80,
         help='When SPIX should stop (we recovered above X % of original probability)'
+    )
+
+    parser.add_argument(
+        '--gt_forcing',
+        type=lambda x: (str(x).lower() == 'true'),
+        default=False,
+        help='Whether to run the XAI explanation using the ground truth answer (Teacher Forcing).'
     )
 
     # LVLM generation settings

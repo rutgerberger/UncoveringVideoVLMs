@@ -65,101 +65,127 @@ def spix(args, model, processor, input_ids, output_ids, frames, tubelets):
 
 import heapq
 def spix_optimized(args, model, processor, input_ids, output_ids, frames, tubelets, positions=None, opt_mode='combined', use_dynamic_lambda=True):
+    """
+    Finds the approximately optimal set of tubelets maximizing the objective function.
+        ie.: max f(s) = (p(keywords|s) - p(keywords|baseline)) + lambda * (p(keywords|S) - p(keywords|S\s))
+    
+    That is to say, we maximize two parts:
+        - insertion loss (p(keywords|s) - p(keywords|baseline))
+            "How much does the probability increase when unblurring/unmasking this part of the video"
+        - deletion loss (p(keywords|S) - p(keywords|S\s))
+            "How much does the probability decrease when masking out this part of the video"
+    
+    In some cases, insertion dominates deletion (small piece of information suffices).
+    Therefore we calculate dynamic lambda to make both balanced (and maintain approximate
+    submodularity).
+    """
     unique_tubes = np.unique(tubelets)
     full_ids = torch.cat((input_ids, output_ids), dim=1)
     video_array = np.stack([np.array(img) for img in frames])
     
+    # -- Initialization for the algorithm
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
-    
-    blurred_video = precompute_blurred_video(video_array) 
-    frames_blur_base = [Image.fromarray(frame.astype(np.uint8)) for frame in blurred_video]
-    prob_blur = get_prob(args, model, processor, full_ids, output_ids, frames_blur_base, positions)
+    # -- Create two versions: blurred blurred and constant (deletion)
+    blurred_video = precompute_blurred_video(video_array)
+    constant_video = np.full_like(video_array, 255)
+    # -- Based on the insertion_mask_type arg, compare probs to blur/constant
+    if args.insertion_mask_type == 'blur':
+        baseline_video = blurred_video
+    else:
+        baseline_video = constant_video
+    frames_base = [Image.fromarray(frame.astype(np.uint8)) for frame in baseline_video]
+    prob_base = get_prob(args, model, processor, full_ids, output_ids, frames_base, positions)
 
     selected_tubes = []
     tubelet_scores = {}
     current_total_score = 0.0 
     queue = []
     
-    # Use blur_mask_fast directly as function expects numpy, converting down below
-    apply_mask_func = lambda v_arr, tubes, active: apply_blur_mask_fast(v_arr, tubes, active) if args.mask_type == 'blur' else apply_mask_fast(v_arr, tubes, active)
+    apply_ins_mask = lambda v_arr, tubes, active: apply_blur_mask_fast(v_arr, baseline_video, tubes, active)
+    apply_del_mask = lambda v_arr, tubes, keep: apply_blur_mask_fast(v_arr, constant_video, tubes, keep)
     
     eprint("Precomputing tubelet centroids for distance penalty...")
     centroids_dict = precompute_tubelet_centroids(tubelets, unique_tubes)
     
+    # -- Initial evaluation
     eprint(f"Performing initial evaluation for Lazy Greedy (Mode: {opt_mode})...")
-    
     initial_evals = []
     max_ins_gain = 0.0
     max_del_gain = 0.0
-    
     for tube in unique_tubes:
-        frames_ins = [Image.fromarray(f) for f in apply_mask_func(video_array, tubelets, [tube])]
+        # -- Gather probabilities for insertion / deletion
+        frames_ins = [Image.fromarray(f) for f in apply_ins_mask(video_array, tubelets, [tube])]
         prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
-        
         keep_tubes = [t for t in unique_tubes if t != tube] 
-        frames_del = [Image.fromarray(f) for f in apply_mask_func(video_array, tubelets, keep_tubes)]
+        frames_del = [Image.fromarray(f) for f in apply_del_mask(video_array, tubelets, keep_tubes)]
         prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions) 
-        
-        ins_gain = max(0, prob_ins - prob_blur)
+        # -- Calculate marginal gains and update max scores
+        ins_gain = max(0, prob_ins - prob_base)
         del_gain = max(0, prob_orig - prob_del)
         max_ins_gain = max(max_ins_gain, ins_gain)
         max_del_gain = max(max_del_gain, del_gain)
         initial_evals.append((tube, prob_ins, prob_del))
 
+    # -- Dynamic Lambda Computation
     dynamic_lambda = 1.0
     if use_dynamic_lambda and opt_mode == 'combined':
         safe_del_gain = max(1e-5, max_del_gain)
         dynamic_lambda = max_ins_gain / safe_del_gain
         eprint(f"Computed Dynamic Lambda: {dynamic_lambda:.4f} (Max Ins: {max_ins_gain:.4f}, Max Del: {max_del_gain:.4f})")
 
+    # -- Lazy Greedy Scores
     for tube, p_ins, p_del in initial_evals:
         if opt_mode == 'insertion':
-            score = p_ins
+            score = p_ins - prob_base
         elif opt_mode == 'deletion':
             score = prob_orig - p_del
         else:
-            score = p_ins + dynamic_lambda * (prob_orig - p_del)
+            score = (p_ins - prob_base) + dynamic_lambda * (prob_orig - p_del)
         heapq.heappush(queue, (-score, tube)) 
 
+    # -- Main Loop --
     for step in range(len(unique_tubes)):
         best_tube = None
         best_marginal_gain = -float('inf')
         best_absolute_score = -float('inf')
-        
+
         while queue:
+            # -- Prerequisites: insertion / deletion probs
             _, candidate = heapq.heappop(queue)
             candidate_set = selected_tubes + [candidate]
-            frames_ins = [Image.fromarray(f) for f in apply_mask_func(video_array, tubelets, candidate_set)]
+            frames_ins = [Image.fromarray(f) for f in apply_ins_mask(video_array, tubelets, candidate_set)]
             prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
-            
             keep_tubes = [t for t in unique_tubes if t not in candidate_set]
-            frames_del = [Image.fromarray(f) for f in apply_mask_func(video_array, tubelets, keep_tubes)]
+            frames_del = [Image.fromarray(f) for f in apply_del_mask(video_array, tubelets, keep_tubes)]
             prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
             
+            # -- Optional: distance penalty
             dist_penalty = get_distance_penalty(candidate, selected_tubes, centroids_dict)
             
+            # -- Score Reflection (Match Objective Function)
             if opt_mode == 'insertion':
-                actual_absolute_score = prob_ins - (args.L1 * dist_penalty)
+                actual_absolute_score = (prob_ins - prob_base) - (args.L1 * dist_penalty)
             elif opt_mode == 'deletion':
                 actual_absolute_score = (prob_orig - prob_del) - (args.L1 * dist_penalty)
             else:
-                actual_absolute_score = prob_ins + dynamic_lambda * (prob_orig - prob_del) - (args.L1 * dist_penalty)
-                
+                actual_absolute_score = (prob_ins - prob_base) + dynamic_lambda * (prob_orig - prob_del) - (args.L1 * dist_penalty)
             actual_marginal_gain = actual_absolute_score - current_total_score
             
+            # -- Queue is empty: done
             if not queue:
                 best_tube = candidate
                 best_marginal_gain = actual_marginal_gain
                 best_absolute_score = actual_absolute_score
                 break
-                
             next_best_upper_bound_gain = -queue[0][0] - current_total_score
-   
+
+            # -- Calculated Gain is actually > Next Gain (Lazy Greedy): use this one
             if actual_marginal_gain >= next_best_upper_bound_gain:
                 best_tube = candidate
                 best_marginal_gain = actual_marginal_gain
                 best_absolute_score = actual_absolute_score
                 break
+            # -- If not update the score
             else:
                 heapq.heappush(queue, (-actual_absolute_score, candidate))
                 
@@ -174,7 +200,7 @@ def spix_optimized(args, model, processor, input_ids, output_ids, frames, tubele
             break
             
     return selected_tubes, tubelet_scores
-
+    
 def frame_redundancy(args, model, processor, input_ids, output_ids, frames, compute_interactions=True):
     """
     Calculates frame importance using Monte Carlo Shapley approximation 
