@@ -4,6 +4,125 @@ from scipy.ndimage import center_of_mass
 import yake
 import torch
 import torch.nn.functional as F
+import heapq
+
+def initialize_lazy_greedy_queues(args, model, processor, full_ids, output_ids, video_array, tubelets, unique_tubes, baseline_ins, baseline_del, prob_orig, prob_base, positions):
+    queue_ins = []
+    queue_del = []
+    
+    for tube in unique_tubes:
+        # -- Gather probabilities for insertion
+        frames_ins = apply_universal_mask(video_array, baseline_ins, tubelets, [tube])
+        prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
+        
+        # -- Gather probabilities for deletion
+        keep_tubes = [t for t in unique_tubes if t != tube]
+        frames_del = apply_universal_mask(video_array, baseline_del, tubelets, keep_tubes)
+        prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
+        
+        # -- Populate separate queues
+        heapq.heappush(queue_ins, (-(prob_ins - prob_base), tube))
+        heapq.heappush(queue_del, (-(prob_orig - prob_del), tube))
+        
+    return queue_ins, queue_del
+
+
+
+def run_lazy_greedy_search(args, model, processor, full_ids, output_ids, 
+        video_array, tubelets, unique_tubes, queue, mode, baseline_ins, 
+        baseline_del, prob_orig, prob_base, centroids_dict, positions):
+    """
+    requires:
+             args, model, processor: common sense
+             full_ids, output_ids:   ids of full prompt and output
+             video_array:            original frames
+             tubelets, unique_tubes: set of tubelets (should be similar)
+             queue:                  initialized heapq
+             mode:                   'insertion' or 'deletion'
+             baseline_ins/del:       baseline frames (blurred / constant)
+             prob_orig:              list of probabilities (per token ID)
+             prob_base:              same but then for blurred vid
+             centroids_dict:         precomputed centroids for distance penalty
+             positions:              keyword positions
+    returns: 
+             selected_tubes:         optimal set of tubelets which maximizes 
+                                     the objective function, based on mode
+    """
+    selected_tubes = []
+    tubelet_scores = {}
+    current_total_score = 0.0 
+    
+    # -- Main Loop --
+    for step in range(len(unique_tubes)):
+        best_tube = None
+        best_marginal_gain = -float('inf')
+        best_absolute_score = -float('inf')
+        prob_ins = 0.0
+        prob_del = 0.0
+
+        while queue:
+            # -- Prerequisites: insertion / deletion probs
+            _, candidate = heapq.heappop(queue)
+            candidate_set = selected_tubes + [candidate]
+            if mode == 'insertion':
+                frames_ins = apply_universal_mask(video_array, baseline_ins, tubelets, candidate_set)
+                prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
+            else:
+                keep_tubes = [t for t in unique_tubes if t not in candidate_set]
+                frames_del = apply_universal_mask(video_array, baseline_del, tubelets, keep_tubes)
+                prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
+
+            # -- Optional: distance penalty
+            dist_penalty = get_distance_penalty(candidate, selected_tubes, centroids_dict)
+            
+            # -- Score Reflection (Match Objective Function)
+            if mode == 'insertion':
+                actual_absolute_score = (prob_ins - prob_base) - (args.L1 * dist_penalty)
+            else:
+                actual_absolute_score = (prob_orig - prob_del) - (args.L1 * dist_penalty)
+                
+            actual_marginal_gain = actual_absolute_score - current_total_score
+            
+            # -- Queue is empty: done
+            if not queue:
+                best_tube = candidate
+                best_marginal_gain = actual_marginal_gain
+                best_absolute_score = actual_absolute_score
+                break
+                
+            next_best_upper_bound_gain = -queue[0][0] - current_total_score
+
+            # -- Calculated Gain is actually > Next Gain (Lazy Greedy): use this one
+            if actual_marginal_gain >= next_best_upper_bound_gain:
+                best_tube = candidate
+                best_marginal_gain = actual_marginal_gain
+                best_absolute_score = actual_absolute_score
+                break
+            # -- If not update the score
+            else:
+                heapq.heappush(queue, (-actual_absolute_score, candidate))
+                
+        tubelet_scores[best_tube] = max(0.0, best_marginal_gain)
+        current_total_score = best_absolute_score
+        selected_tubes.append(best_tube)
+        
+        # -- Logging and ratio calculation based on mode
+        if mode == 'insertion':
+            eprint(f"Ins Step {step+1}: Tube {best_tube} | Gain: {best_marginal_gain:.4f} | Total: {current_total_score:.4f} | P_ins: {prob_ins:.4f}")
+            objective_ratio = prob_ins / max(prob_orig, 1e-5)
+        else:
+            eprint(f"Del Step {step+1}: Tube {best_tube} | Gain: {best_marginal_gain:.4f} | Total: {current_total_score:.4f} | P_orig-P_del: {(prob_orig - prob_del):.4f}")
+            objective_ratio = (prob_orig - prob_del) / max(prob_orig, 1e-5)
+
+        # -- Early Stopping
+        if len(selected_tubes) > len(unique_tubes) * 0.25 or objective_ratio >= 0.90:
+            if best_marginal_gain < 1e-4:
+                eprint(f"Early stopping triggered at step {step+1}: Sufficient confidence reached and gain flatlined.")
+                break
+                
+    return selected_tubes, tubelet_scores
+
+
 
 def precompute_tubelet_centroids(tubelets, unique_tubes):
     """
@@ -23,6 +142,8 @@ def precompute_tubelet_centroids(tubelets, unique_tubes):
         centroids_dict[tube_id] = np.array([norm_t, norm_y, norm_x])
     return centroids_dict
 
+
+
 def get_distance_penalty(candidate_tube, selected_tubes, centroids_dict):
     """
     Calculates the minimum distance from the candidate to the already selected group.
@@ -39,143 +160,3 @@ def get_distance_penalty(candidate_tube, selected_tubes, centroids_dict):
     # This encourages the candidate to "attach" to the existing blob.
     min_distance = np.min(distances)
     return min_distance
-
-
-def apply_mask_fast(video_array, tubelets, active_tubes):
-    """Optimized masking returning a raw Numpy array directly."""
-    mask = np.isin(tubelets, active_tubes)[..., np.newaxis]
-    masked_array = (video_array * mask).astype(np.uint8)
-    return masked_array
-
-
-def apply_blur_mask_fast(video_array, blurred_video, tubelets, active_tubes):
-    """
-    Optimized masking returning a raw Numpy array directly.
-    Selected tubelets show original pixels, unselected show blurred pixels.
-    """
-    # Create the boolean mask (T, H, W) and add the channel dimension (T, H, W, 1)
-    mask = np.isin(tubelets, active_tubes)[..., np.newaxis]
-    masked_array = np.where(mask, video_array, blurred_video)
-    return masked_array.astype(np.uint8)
-
-def precompute_blurred_video(video_array, kernel_size=(51, 51)):
-    """
-    Precomputes a heavily blurred version of the video to save time during the greedy search.
-    Kernel size should be odd. Larger kernel = heavier blur.
-    """
-    blurred_video = np.empty_like(video_array)
-    for i in range(len(video_array)):
-        # Apply Gaussian blur. 0 means OpenCV automatically calculates standard deviation
-        blurred_video[i] = cv2.GaussianBlur(video_array[i], kernel_size, 0)
-    return blurred_video
-
-def get_token_probs(args, model, processor, full_ids, output_ids, frames):
-    """
-    Calculates the token-wise probability of the target 'output_ids' given frames.
-    Supports both Qwen2.5-VL and Video-LLaVA architectures.
-    Replaces the old pred_probs function.
-    """
-    if args.model == 'qwen':
-        inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt")
-    else:
-        inputs = processor(text=" ", videos=frames, return_tensors="pt")
-        
-    pixel_values = inputs['pixel_values_videos'].to(model.device, dtype=model.dtype)
-    
-    # Safety Check: Ensure 5D tensor (Batch, Time, Channels, Height, Width)
-    if pixel_values.dim() == 4:
-        pixel_values = pixel_values.unsqueeze(0)
-        
-    forward_kwargs = {
-        "input_ids": full_ids,
-        "attention_mask": torch.ones_like(full_ids).to(model.device),
-        "pixel_values_videos": pixel_values,
-        "use_cache": True
-    }
-
-    # Conditionally add Qwen's specific temporal grid tensor if it exists
-    if 'video_grid_thw' in inputs:
-        forward_kwargs['video_grid_thw'] = inputs['video_grid_thw'].to(model.device)
-        
-    with torch.no_grad():
-        outputs = model(**forward_kwargs)
-        
-    logits = outputs.logits  # Shape: [batch_size, seq_len, vocab_size]
-    out_len = output_ids.shape[-1]
-    
-    target_logits = logits[:, -out_len - 1 : -1, :] 
-    probs = F.softmax(target_logits, dim=-1) 
-    target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-    
-    if target_probs.dim() == 0:
-        target_probs = target_probs.unsqueeze(0)
-        
-    return target_probs.squeeze(0) # Return 1D tensor of token probabilities
-
-# NOTE: Added `processor` to the signature
-def find_keywords(args, model, processor, input_ids, output_ids, frames, blur_frames, output_text, tokenizer=None, use_yake=False, special_ids=None):
-    # Ensure special_ids is defined, default to empty list if not passed
-    if special_ids is None:
-        special_ids = []
-    seq_len = output_ids.shape[-1]
-    
-    # short outputs (<= 4 tokens)
-    if seq_len <= 4:
-        # Clean the EOS token if it exists
-        clean_output_ids = output_ids
-        if output_ids[0, -1] == tokenizer.eos_token_id:
-            clean_output_ids = output_ids[:, :-1] 
-            
-        # Map every valid token ID to its own position and string
-        positions = list(range(clean_output_ids.shape[-1]))
-        keywords = [tokenizer.decode(idx).strip() for idx in clean_output_ids[0]]
-        # Filter out empty strings caused by special tokens
-        valid_indices = [i for i, kw in enumerate(keywords) if kw]
-        positions = [positions[i] for i in valid_indices]
-        keywords = [keywords[i] for i in valid_indices]
-        
-    # long outputs (> 4 tokens)
-    else: 
-        if use_yake:
-            import yake
-            num_words = len(output_text.split())
-            keywords_num = 3 if num_words <= 10 else num_words // 4
-            kw_extractor = yake.KeywordExtractor(lan="en", n=2, dedupLim=0.2, top=keywords_num, features=None)
-            extracted = kw_extractor.extract_keywords(output_text)
-            kw_strings = [kw[0] for kw in extracted]
-            positions = []
-            keywords = []
-            for kw in kw_strings:
-                kw_ids = tokenizer.encode(kw, add_special_tokens=False)
-                # Assuming match_keywords is a helper function defined elsewhere
-                matched_pos = match_keywords(output_ids[0].tolist(), kw_ids)
-                if matched_pos:
-                    positions.extend(matched_pos)
-                    # Use the actual decoded tokens to maintain 1:1 mapping
-                    keywords.extend([tokenizer.decode(output_ids[0][p]).strip() for p in matched_pos])
-                    
-        else:
-            # Full visual-grounding logic
-            full_prompt = torch.cat((input_ids, output_ids), dim=1)
-            
-            # Using the new get_token_probs method
-            probs = get_token_probs(args, model, processor, full_prompt, output_ids, frames)
-            probs_blur = get_token_probs(args, model, processor, full_prompt, output_ids, blur_frames)
-            
-            # Avoid torch.log(0) by clamping probabilities to a tiny number
-            eps = 1e-7
-            probs_safe = torch.clamp(probs, min=eps)
-            probs_blur_safe = torch.clamp(probs_blur, min=eps)
-            
-            # Condition 1: Log prob difference > 1.0 (Clear frames +-2.7x more likely)
-            # Condition 2: Base prob must be > 0.001 (Prevents random noise from passing)
-            # Condition 3: Not a special token
-            condition = (
-                (torch.log(probs_safe) - torch.log(probs_blur_safe) > 1.0) & 
-                (probs > 0.001) & 
-                (~torch.isin(output_ids[0], torch.tensor(special_ids, device=probs.device)))
-            )
-            positions = torch.where(condition)[0].tolist()
-            keywords = [tokenizer.decode(output_ids[0][idx]).strip() for idx in positions]
-            
-    return positions, keywords

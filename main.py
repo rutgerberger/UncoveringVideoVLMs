@@ -29,7 +29,7 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     """
     This block runs the following pipeline:
         Keyword Extraction -> SPIX -> Explicit Logging -> AUC Evaluation -> Visualization.
-        
+
     returns the auc metrics.
     """
     start = time.time()
@@ -52,15 +52,12 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     # -- Baseline Videos: What Happens to Video \ Tubelets
     baseline_ins = get_baseline_insertion(args, video_array)
     baseline_del = get_baseline_deletion(args, video_array)
-    # -- Calculate explicit probability drops (logging purposes)
-    # Insertion: Foreground is original video, Background is baseline_ins
-    #TODO investigate this logic
+    # -- Mask and calculate probability drops (logging purposes)
     frames_ins = apply_universal_mask(video_array, baseline_ins, tubelets, final_tubelets)
     prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
-    # Deletion: Foreground is original video, Background is baseline_del
     unique_tubes = np.unique(tubelets)
     tubes_to_keep = [t for t in unique_tubes if t not in final_tubelets]
-    frames_del = apply_universal_mask(video_array, baseline_del, tubelets, tubes_to_keep)
+    frames_del = apply_universal_mask(video_array, baseline_ins, tubelets, tubes_to_keep)
     prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
     # -- Logging
     log_func(f"\n=== {mode_name} TUBELETS SEARCH LOG ===")
@@ -129,22 +126,23 @@ def explain_vid(data, model, processor, args, tokenizer):
         video_array, tubelets = generate_tubelets(frames, args)
         eprint(f"Generated tubelets in {time.time() - start}s")
         
-        if getattr(args, 'save_visuals', True):
-            visualize_frames(frames, os.path.join(args.output_dir, f"{ivd}_frames.gif"))
-            visualize_tubelets(video_array, tubelets, os.path.join(args.output_dir, f"{ivd}_slic.gif"))
+        #if getattr(args, 'save_visuals', True):
+        #    visualize_frames(frames, os.path.join(args.output_dir, f"{ivd}_frames.gif"))
+        #    visualize_tubelets(video_array, tubelets, os.path.join(args.output_dir, f"{ivd}_slic.gif"))
         
+        # -- Gathering Original Model Output
         eprint(f"{ivd+1}/{num_videos}: Acquiring Model Output.")
         prompt = f"USER: {DEFAULT_VIDEO_TOKEN}\n{qs}. ASSISTANT:"
         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
         log(f"Model Answer: {output_text}")
 
-        # Precompute constants used for both standard and GT pipelines
+        # -- Precompute constants used for both standard and GT pipelines
         baseline_ins = get_baseline_insertion(args, video_array)
         baseline_ins_frames = [Image.fromarray(f) for f in baseline_ins]
         special_ids = [tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id]
         special_ids = [idx for idx in special_ids if idx is not None]
 
-        # -- First Step: Standard Evaluation on Given Answer
+        # -- Runs standard tubelet selection & vis. pipeline with model's answer
         auc_ins, auc_del = run_xai_pipeline(
             args, model, processor, tokenizer, frames, video_array, tubelets, baseline_ins_frames, special_ids,
             input_ids, output_ids, output_text, ivd, log, mode_name="STANDARD", file_prefix=""
@@ -152,7 +150,7 @@ def explain_vid(data, model, processor, args, tokenizer):
         global_metrics["auc_ins"].append(auc_ins)
         global_metrics["auc_del"].append(auc_del)
 
-        # -- Second Step: Evaluation on Ground Truth Tokens
+        # -- Runs tubelet & visualization selection pipeline with ground truth answer
         ground_truth = str(correct_idx)
         log(f"Ground Truth Label: {ground_truth}")
         gt_ids = tokenizer(ground_truth, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)

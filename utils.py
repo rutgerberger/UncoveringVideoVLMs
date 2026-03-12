@@ -28,6 +28,7 @@ DEFAULT_VIDEO_TOKEN = "<video>"
 NUM_FRAMES = 4
 
 def eprint(*args, **kwargs):
+    """Helper to log to stderr."""
     sep = ' '
     combined_text = sep.join(str(arg) for arg in args)
     wrapped_lines = []
@@ -51,18 +52,8 @@ def match_keywords(output_list, kw_ids):
             return list(range(i, i + kw_len))
     return []
 
-def precompute_tubelet_centroids(tubelets, unique_tubes):
-    T, H, W = tubelets.shape
-    centroids_list = center_of_mass(np.ones_like(tubelets), tubelets, unique_tubes)
-    centroids_dict = {}
-    for tube_id, (t, y, x) in zip(unique_tubes, centroids_list):
-        norm_t = t / T if T > 1 else 0.0
-        norm_y = y / H
-        norm_x = x / W
-        centroids_dict[tube_id] = np.array([norm_t, norm_y, norm_x])
-    return centroids_dict
-
 def get_distance_penalty(candidate_tube, selected_tubes, centroids_dict):
+    """Function to return a distance penalty to a new candidate tube"""
     if not selected_tubes:
         return 0.0 
     candidate_pos = centroids_dict[candidate_tube]
@@ -110,6 +101,11 @@ def apply_universal_mask(foreground_array, background_array, tubelets, active_tu
     Where tubelets are 'active', shows foreground_array.
     Where tubelets are NOT 'active', shows background_array.
     Returns a list of PIL Images ready for the VLM.
+    
+    Insertion:
+    - Active tubelets: original video, else: blurred
+    Deletion:
+    - Active tubelets: masked out, else: original video
     """
     mask = np.isin(tubelets, active_tubes)[..., np.newaxis]
     masked_array = np.where(mask, foreground_array, background_array).astype(np.uint8)
@@ -123,7 +119,7 @@ def get_data(args, row):
     end_sec = 1
     # -- ImageNet Data Handling
     if is_imagenet:
-        question_text = "What object is in this video? Be specific (if it's an animal, which exact species / race). Answer with only the class name."
+        question_text = "If you were a classifier trained on ImageNet, what object is in this video? Answer with only the class name."
         cur_prompt = question_text
         options_prompt = ""
         qs = cur_prompt
@@ -282,7 +278,7 @@ def get_token_probs(args, model, processor, full_ids, output_ids, frames):
     return target_probs.squeeze(0) 
 
 def get_prob(args, model, processor, full_ids, output_ids, frames, positions=None):
-    """Calculates mean probability; optionally filtered by positions."""
+    """Calculates mean probability of the output_ids; optionally filtered by positions."""
     if args.model == 'qwen':
         inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt")
     else:
@@ -402,6 +398,10 @@ def visualize_interaction_matrix(interaction_matrix, output_path):
     plt.close()
 
 def find_keywords(args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, output_text, tokenizer=None, use_yake=False, special_ids=None):
+    """
+    Finds the words that change mostly when comparing to a baseline video.
+    - baseline insertion: we are comparing to a blurred version preferably
+    """
     if special_ids is None:
         special_ids = []
     seq_len = output_ids.shape[-1]
@@ -436,7 +436,6 @@ def find_keywords(args, model, processor, input_ids, output_ids, frames, baselin
         else:
             full_prompt = torch.cat((input_ids, output_ids), dim=1)
             probs = get_token_probs(args, model, processor, full_prompt, output_ids, frames)
-            # CHANGED: Use the baseline_ins_frames here
             probs_blur = get_token_probs(args, model, processor, full_prompt, output_ids, baseline_ins_frames)
             
             eps = 1e-7
