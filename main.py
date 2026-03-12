@@ -15,7 +15,7 @@ from transformers import VideoLlavaForConditionalGeneration, VideoLlavaProcessor
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 from utils import *
-from method import spix, spix_optimized, frame_redundancy
+from method import spix_optimized, frame_redundancy
 from args import init_args
 
 DEFAULT_VIDEO_TOKEN = "<video>"
@@ -33,6 +33,7 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     returns the auc metrics.
     """
     start = time.time()
+    
     # -- Finding Keywords and Probabilities
     eprint(f"{ivd+1}/{MAX_VIDEOS}: Selecting Important Tubelets ({mode_name}).")
     positions, keywords = find_keywords(
@@ -44,43 +45,74 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
 
     # -- Obtaining Tubelets
-    final_tubelets, tubelet_scores = spix_optimized(
+    selected_ins, selected_del, scores_ins, scores_del = spix_optimized(
         args, model, processor, input_ids, output_ids, frames, tubelets,
-        positions=positions, opt_mode=args.opt_mode, use_dynamic_lambda=args.use_dynamic_lambda
+        positions=positions
     )
+
+    # -- Calculating Union and Intersection Masks
+    unique_tubes = np.unique(tubelets)
+    selected_union = list(set(selected_ins) | set(selected_del))
+    selected_inter = list(set(selected_ins) & set(selected_del))
+    
+    scores_union = {t: max(scores_ins.get(t, 0), scores_del.get(t, 0)) for t in selected_union}
+    scores_inter = {t: min(scores_ins.get(t, 0), scores_del.get(t, 0)) for t in selected_inter}
 
     # -- Baseline Videos: What Happens to Video \ Tubelets
     baseline_ins = get_baseline_insertion(args, video_array)
     baseline_del = get_baseline_deletion(args, video_array)
-    # -- Mask and calculate probability drops (logging purposes)
-    frames_ins = apply_universal_mask(video_array, baseline_ins, tubelets, final_tubelets)
+    
+    # -- Calculate probability drops (logging purposes)
+    # Insertion: Foreground is original video, Background is baseline_ins
+    frames_ins = apply_universal_mask(video_array, baseline_ins, tubelets, selected_ins)
     prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
-    unique_tubes = np.unique(tubelets)
-    tubes_to_keep = [t for t in unique_tubes if t not in final_tubelets]
-    frames_del = apply_universal_mask(video_array, baseline_ins, tubelets, tubes_to_keep)
+    # Deletion: Foreground is original video (keep_tubes), Background is masked video
+    keep_tubes_del = [t for t in unique_tubes if t not in selected_del]
+    frames_del = apply_universal_mask(video_array, baseline_del, tubelets, keep_tubes_del)
     prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
+
     # -- Logging
     log_func(f"\n=== {mode_name} TUBELETS SEARCH LOG ===")
     log_func(f"Created tubelets in {time.time() - start:.2f}s")
-    log_func(f"Final tubelets: {final_tubelets} ({len(final_tubelets)}/{len(unique_tubes)})")
+    log_func(f"Final Insertion tubelets: {selected_ins} ({len(selected_ins)}/{len(unique_tubes)})")
+    log_func(f"Final Deletion tubelets: {selected_del} ({len(selected_del)}/{len(unique_tubes)})")
+    log_func(f"Union mask size: {len(selected_union)} | Intersection mask size: {len(selected_inter)}")
     log_func(f"Prob Original: {prob_orig:.5f}")
     log_func(f"Prob Insertion: {prob_ins:.5f} (Diff: {prob_orig - prob_ins:.5f})")
     log_func(f"Prob Deletion: {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
+
     # -- Metric calculation
-    auc_ins, auc_del = evaluate_auc(
-        args, model, processor, full_ids, output_ids, frames, tubelets, final_tubelets, ivd=ivd,
-        positions=positions, num_steps=20
-    )
-    log_func(f"[{mode_name}] AUC Insertion: {auc_ins:.4f}")
-    log_func(f"[{mode_name}] AUC Deletion: {auc_del:.4f}")
+    # # Evaluate Insertion AUC using the insertion-optimized tubelets
+    # auc_ins, _ = evaluate_auc(
+    #     args, model, processor, full_ids, output_ids, frames, tubelets, selected_ins, 
+    #     ivd=f"{ivd}_ins", positions=positions, num_steps=20
+    # )
+    # # Evaluate Deletion AUC using the deletion-optimized tubelets
+    # _, auc_del = evaluate_auc(
+    #     args, model, processor, full_ids, output_ids, frames, tubelets, selected_del, 
+    #     ivd=f"{ivd}_del", positions=positions, num_steps=20
+    # )
+    auc_ins_union, auc_del_union = evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_union, ivd=f"{ivd}_union", positions=positions, num_steps=20)
+    auc_ins_inter, auc_del_inter = evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_inter, ivd=f"{ivd}_inter", positions=positions, num_steps=20)
+    
+    log_func(f"[{mode_name}] AUC Union - Ins: {auc_ins_union:.4f} | Del: {auc_del_union:.4f}")
+    log_func(f"[{mode_name}] AUC Inter - Ins: {auc_ins_inter:.4f} | Del: {auc_del_inter:.4f}")
+
     # -- Saving gifs for visualization
     if getattr(args, 'save_visuals', True):
         eprint(f"{ivd+1}/{MAX_VIDEOS}: Visualizing the Masked Tubelets ({mode_name}).")
-        tubes_to_vis = [t for t in unique_tubes if t not in final_tubelets]
-        visualize_spix(video_array, baseline_del, tubelets, tubes_to_vis, os.path.join(args.output_dir, f"{ivd}_{file_prefix}mask.gif"))
-        visualize_heatmap(video_array, tubelets, tubelet_scores, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight.gif"))
         
-    return auc_ins, auc_del
+        # Original visualization behavior (using union mask as the default masking visual)
+        keep_tubes_vis = [t for t in unique_tubes if t not in selected_union]
+        visualize_spix(video_array, baseline_del, tubelets, keep_tubes_vis, os.path.join(args.output_dir, f"{ivd}_{file_prefix}mask_union.gif"))
+        
+        # 4 Heatmaps
+        visualize_heatmap(video_array, tubelets, scores_ins, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_ins.gif"))
+        visualize_heatmap(video_array, tubelets, scores_del, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_del.gif"))
+        visualize_heatmap(video_array, tubelets, scores_union, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_union.gif"))
+        visualize_heatmap(video_array, tubelets, scores_inter, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_inter.gif"))
+        
+    return auc_ins_union, auc_del_union, auc_ins_inter, auc_del_inter
 
 def explain_vid(data, model, processor, args, tokenizer):
     """
@@ -103,9 +135,12 @@ def explain_vid(data, model, processor, args, tokenizer):
     num_videos = min(len(data), MAX_VIDEOS) if MAX_VIDEOS > 0 else len(data)
     
     global_metrics = {
-        "auc_ins": [], "auc_del": [],
-        "gt_auc_ins": [], "gt_auc_del": []
+        "auc_ins_union": [], "auc_del_union": [],
+        "auc_ins_inter": [], "auc_del_inter": [],
+        "gt_auc_ins_union": [], "gt_auc_del_union": [],
+        "gt_auc_ins_inter": [], "gt_auc_del_inter": []
     }
+    
     # -- Main Loop - performs per given video
     for ivd in range(num_videos):
         # -- Data Processing / Logging
@@ -126,10 +161,6 @@ def explain_vid(data, model, processor, args, tokenizer):
         video_array, tubelets = generate_tubelets(frames, args)
         eprint(f"Generated tubelets in {time.time() - start}s")
         
-        #if getattr(args, 'save_visuals', True):
-        #    visualize_frames(frames, os.path.join(args.output_dir, f"{ivd}_frames.gif"))
-        #    visualize_tubelets(video_array, tubelets, os.path.join(args.output_dir, f"{ivd}_slic.gif"))
-        
         # -- Gathering Original Model Output
         eprint(f"{ivd+1}/{num_videos}: Acquiring Model Output.")
         prompt = f"USER: {DEFAULT_VIDEO_TOKEN}\n{qs}. ASSISTANT:"
@@ -143,12 +174,14 @@ def explain_vid(data, model, processor, args, tokenizer):
         special_ids = [idx for idx in special_ids if idx is not None]
 
         # -- Runs standard tubelet selection & vis. pipeline with model's answer
-        auc_ins, auc_del = run_xai_pipeline(
+        auc_ins_union, auc_del_union, auc_ins_inter, auc_del_inter = run_xai_pipeline(
             args, model, processor, tokenizer, frames, video_array, tubelets, baseline_ins_frames, special_ids,
             input_ids, output_ids, output_text, ivd, log, mode_name="STANDARD", file_prefix=""
         )
-        global_metrics["auc_ins"].append(auc_ins)
-        global_metrics["auc_del"].append(auc_del)
+        global_metrics["auc_ins_union"].append(auc_ins_union)
+        global_metrics["auc_del_union"].append(auc_del_union)
+        global_metrics["auc_ins_inter"].append(auc_ins_inter)
+        global_metrics["auc_del_inter"].append(auc_del_inter)
 
         # -- Runs tubelet & visualization selection pipeline with ground truth answer
         ground_truth = str(correct_idx)
@@ -156,20 +189,26 @@ def explain_vid(data, model, processor, args, tokenizer):
         gt_ids = tokenizer(ground_truth, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)
 
         if getattr(args, 'gt_forcing', False) and gt_ids is not None:    
-            auc_ins_gt, auc_del_gt = run_xai_pipeline(
+            auc_ins_union_gt, auc_del_union_gt, auc_ins_inter_gt, auc_del_inter_gt = run_xai_pipeline(
                 args, model, processor, tokenizer, frames, video_array, tubelets, baseline_ins_frames, special_ids,
                 input_ids, gt_ids, ground_truth, ivd, log, mode_name="GROUND TRUTH", file_prefix="gt_"
             )
-            global_metrics["gt_auc_ins"].append(auc_ins_gt)
-            global_metrics["gt_auc_del"].append(auc_del_gt)
+            global_metrics["gt_auc_ins_union"].append(auc_ins_union_gt)
+            global_metrics["gt_auc_del_union"].append(auc_del_union_gt)
+            global_metrics["gt_auc_ins_inter"].append(auc_ins_inter_gt)
+            global_metrics["gt_auc_del_inter"].append(auc_del_inter_gt)
 
-    # Final Aggregation Log
+    # -- Final Aggregation Log
     with open(os.path.join(args.output_dir, 'final_metrics.json'), 'w') as f:
         summary = {
-            "mean_auc_ins": np.mean(global_metrics["auc_ins"]) if global_metrics["auc_ins"] else 0,
-            "mean_auc_del": np.mean(global_metrics["auc_del"]) if global_metrics["auc_del"] else 0,
-            "mean_gt_auc_ins": np.mean(global_metrics["gt_auc_ins"]) if global_metrics["gt_auc_ins"] else 0,
-            "mean_gt_auc_del": np.mean(global_metrics["gt_auc_del"]) if global_metrics["gt_auc_del"] else 0,
+            "mean_auc_ins_union": np.mean(global_metrics["auc_ins_union"]) if global_metrics["auc_ins_union"] else 0,
+            "mean_auc_del_union": np.mean(global_metrics["auc_del_union"]) if global_metrics["auc_del_union"] else 0,
+            "mean_auc_ins_inter": np.mean(global_metrics["auc_ins_inter"]) if global_metrics["auc_ins_inter"] else 0,
+            "mean_auc_del_inter": np.mean(global_metrics["auc_del_inter"]) if global_metrics["auc_del_inter"] else 0,
+            "gt_auc_ins_union": np.mean(global_metrics["gt_auc_ins_union"]) if global_metrics["gt_auc_ins_union"] else 0,
+            "gt_auc_del_union": np.mean(global_metrics["gt_auc_del_union"]) if global_metrics["gt_auc_del_union"] else 0,
+            "gt_auc_ins_inter": np.mean(global_metrics["gt_auc_ins_inter"]) if global_metrics["gt_auc_ins_inter"] else 0,
+            "gt_auc_del_inter": np.mean(global_metrics["gt_auc_del_inter"]) if global_metrics["gt_auc_del_inter"] else 0,
         }
         json.dump(summary, f, indent=4)
     eprint(f"\nExperiment Complete. Mean metrics saved to {args.output_dir}/final_metrics.json")

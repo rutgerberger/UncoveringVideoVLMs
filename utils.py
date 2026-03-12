@@ -52,15 +52,6 @@ def match_keywords(output_list, kw_ids):
             return list(range(i, i + kw_len))
     return []
 
-def get_distance_penalty(candidate_tube, selected_tubes, centroids_dict):
-    """Function to return a distance penalty to a new candidate tube"""
-    if not selected_tubes:
-        return 0.0 
-    candidate_pos = centroids_dict[candidate_tube]
-    selected_positions = np.array([centroids_dict[t] for t in selected_tubes])
-    distances = np.linalg.norm(selected_positions - candidate_pos, axis=1)
-    min_distance = np.min(distances)
-    return min_distance
 
 def precompute_blurred_video(video_array, kernel_fraction=0.3, passes=3):
     """
