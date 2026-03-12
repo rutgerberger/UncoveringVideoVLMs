@@ -12,11 +12,6 @@ import itertools
 
 PROB_DELTA = 0.01
 
-# def necessity_score(prob_orig, prob_del):
-#     return prob_orig - prob_del
-
-# def sufficiency_score(prob_ins, prob_empty):
-#     return prob_ins - prob_empty
 
 
 def spix(args, model, processor, input_ids, output_ids, frames, tubelets):
@@ -63,7 +58,6 @@ def spix(args, model, processor, input_ids, output_ids, frames, tubelets):
         
     return selected_tubes
 
-import heapq
 def spix_optimized(args, model, processor, input_ids, output_ids, frames, tubelets, positions=None, opt_mode='combined', use_dynamic_lambda=True):
     """
     Finds the approximately optimal set of tubelets maximizing the objective function.
@@ -83,42 +77,33 @@ def spix_optimized(args, model, processor, input_ids, output_ids, frames, tubele
     full_ids = torch.cat((input_ids, output_ids), dim=1)
     video_array = np.stack([np.array(img) for img in frames])
     
-    # -- Initialization for the algorithm
-    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
-    # -- Create two versions: blurred blurred and constant (deletion)
-    blurred_video = precompute_blurred_video(video_array)
-    constant_video = np.full_like(video_array, 255)
-    # -- Based on the insertion_mask_type arg, compare probs to blur/constant
-    if args.insertion_mask_type == 'blur':
-        baseline_video = blurred_video
-    else:
-        baseline_video = constant_video
-    frames_base = [Image.fromarray(frame.astype(np.uint8)) for frame in baseline_video]
-    prob_base = get_prob(args, model, processor, full_ids, output_ids, frames_base, positions)
-
+    # -- Initializations for the algorithm
     selected_tubes = []
     tubelet_scores = {}
     current_total_score = 0.0 
     queue = []
     
-    apply_ins_mask = lambda v_arr, tubes, active: apply_blur_mask_fast(v_arr, baseline_video, tubes, active)
-    apply_del_mask = lambda v_arr, tubes, keep: apply_blur_mask_fast(v_arr, constant_video, tubes, keep)
-    
+    baseline_ins = get_baseline_insertion(args, video_array)
+    baseline_del = get_baseline_deletion(args, video_array)    
+    frames_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
+    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
+    prob_base = get_prob(args, model, processor, full_ids, output_ids, frames_base, positions)
+
     eprint("Precomputing tubelet centroids for distance penalty...")
     centroids_dict = precompute_tubelet_centroids(tubelets, unique_tubes)
     
-    # -- Initial evaluation
+    # -- Initial evaluation round
     eprint(f"Performing initial evaluation for Lazy Greedy (Mode: {opt_mode})...")
     initial_evals = []
     max_ins_gain = 0.0
     max_del_gain = 0.0
     for tube in unique_tubes:
         # -- Gather probabilities for insertion / deletion
-        frames_ins = [Image.fromarray(f) for f in apply_ins_mask(video_array, tubelets, [tube])]
+        frames_ins = apply_universal_mask(video_array, baseline_ins, tubelets, [tube])
         prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
         keep_tubes = [t for t in unique_tubes if t != tube] 
-        frames_del = [Image.fromarray(f) for f in apply_del_mask(video_array, tubelets, keep_tubes)]
-        prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions) 
+        frames_del = apply_universal_mask(video_array, baseline_del, tubelets, keep_tubes)
+        prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
         # -- Calculate marginal gains and update max scores
         ins_gain = max(0, prob_ins - prob_base)
         del_gain = max(0, prob_orig - prob_del)
@@ -153,12 +138,12 @@ def spix_optimized(args, model, processor, input_ids, output_ids, frames, tubele
             # -- Prerequisites: insertion / deletion probs
             _, candidate = heapq.heappop(queue)
             candidate_set = selected_tubes + [candidate]
-            frames_ins = [Image.fromarray(f) for f in apply_ins_mask(video_array, tubelets, candidate_set)]
+            frames_ins = apply_universal_mask(video_array, baseline_ins, tubelets, candidate_set)
             prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
             keep_tubes = [t for t in unique_tubes if t not in candidate_set]
-            frames_del = [Image.fromarray(f) for f in apply_del_mask(video_array, tubelets, keep_tubes)]
+            frames_del = apply_universal_mask(video_array, baseline_del, tubelets, keep_tubes)
             prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
-            
+
             # -- Optional: distance penalty
             dist_penalty = get_distance_penalty(candidate, selected_tubes, centroids_dict)
             
@@ -195,9 +180,11 @@ def spix_optimized(args, model, processor, input_ids, output_ids, frames, tubele
         
         eprint(f"Step {step+1}: Tube {best_tube} | Gain: {best_marginal_gain:.4f} | Total: {current_total_score:.4f} | P_ins: {prob_ins:.4f} | P_orig-P_del: {(prob_orig - prob_del):.4f}")
     
-        if best_marginal_gain < 1e-4:
-            eprint(f"Early stopping triggered at step {step+1}: Marginal gain flatlined.")
-            break
+        recovered_ratio = prob_ins / max(prob_orig, 1e-5)
+        if len(selected_tubes) > len(unique_tubes) * 0.25 or recovered_ratio >= 0.90:
+            if best_marginal_gain < 1e-4:
+                eprint(f"Early stopping triggered at step {step+1}: Sufficient confidence reached and gain flatlined.")
+                break
             
     return selected_tubes, tubelet_scores
     

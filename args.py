@@ -56,15 +56,15 @@ def init_args():
 
     parser.add_argument(
         '--use_dynamic_lambda',
-        type=bool,
-        default=True,
+        type=lambda x: (str(x).lower() == 'true'), 
+        default=False,
         help='Calculate the lambda balancing scalar dynamically at Step 0 to balance insertion vs deletion.'
     )
 
     parser.add_argument(
         '--save_visuals', 
         type=lambda x: (str(x).lower() == 'true'), 
-        default=False
+        default=False,
         help='Whether or not to save visuals into the folder (for large scale experiment)'
     )
 

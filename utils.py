@@ -71,35 +71,6 @@ def get_distance_penalty(candidate_tube, selected_tubes, centroids_dict):
     min_distance = np.min(distances)
     return min_distance
 
-def apply_constant_mask(frames_array, tubelets, active_tubes):
-    """Sets the unselected tubelets to black (0) for strict deletion metrics."""
-    mask = np.isin(tubelets, active_tubes)[..., np.newaxis]
-    masked_array = frames_array * mask
-    return [Image.fromarray(frame.astype(np.uint8)) for frame in masked_array]
-
-def apply_mask(frames, tubelets, active_tubes):
-    video_array = np.stack([np.array(img) for img in frames])
-    mask = np.isin(tubelets, active_tubes)[..., np.newaxis]
-    masked_array = video_array * mask
-    return [Image.fromarray(frame.astype(np.uint8)) for frame in masked_array]
-
-def apply_mask_fast(video_array, tubelets, active_tubes):
-    """
-    Selected tubelets show original pixels, unselected plain black
-    """
-    mask = np.isin(tubelets, active_tubes)[..., np.newaxis]
-    masked_array = (video_array * mask).astype(np.uint8)
-    return masked_array
-
-def apply_blur_mask_fast(video_array, blurred_video, tubelets, active_tubes):
-    """
-    Selected tubelets show original pixels, unselected show blurred pixels.
-    """
-    mask = np.isin(tubelets, active_tubes)[..., np.newaxis]
-    masked_array = np.where(mask, video_array, blurred_video)
-    return masked_array.astype(np.uint8)
-
-
 def precompute_blurred_video(video_array, kernel_fraction=0.3, passes=3):
     """
     Precomputes an EXTREMELY blurred version of the video.
@@ -121,15 +92,38 @@ def precompute_blurred_video(video_array, kernel_fraction=0.3, passes=3):
         blurred_video[i] = frame
     return blurred_video
 
+
+def get_baseline_insertion(args, video_array):
+    """Returns the background canvas used for Insertion metrics (Blur or White)."""
+    if args.insertion_mask_type == 'blur':
+        return precompute_blurred_video(video_array)
+    else:
+        return np.full_like(video_array, 255) # White canvas
+
+def get_baseline_deletion(args, video_array):
+    """Returns the masking canvas used for Deletion metrics (White)."""
+    return np.full_like(video_array, 255)
+
+def apply_universal_mask(foreground_array, background_array, tubelets, active_tubes):
+    """
+    Universal blender.
+    Where tubelets are 'active', shows foreground_array.
+    Where tubelets are NOT 'active', shows background_array.
+    Returns a list of PIL Images ready for the VLM.
+    """
+    mask = np.isin(tubelets, active_tubes)[..., np.newaxis]
+    masked_array = np.where(mask, foreground_array, background_array).astype(np.uint8)
+    return [Image.fromarray(f) for f in masked_array]
+
+
 def get_data(args, row):
     is_tgif = getattr(args, 'dataset', '') == 'TGIF'
     is_imagenet = getattr(args, 'dataset', '') == 'imagenet'
     start_sec = 0
     end_sec = 1
-
     # -- ImageNet Data Handling
     if is_imagenet:
-        question_text = "What object is in this video? Answer with only the class name."
+        question_text = "What object is in this video? Be specific (if it's an animal, which exact species / race). Answer with only the class name."
         cur_prompt = question_text
         options_prompt = ""
         qs = cur_prompt
@@ -334,8 +328,8 @@ def create_description(args, model, processor, frames, tokenizer):
 # Visualization Definitions
 # =========================
 
-def visualize_spix(frames, tubelets, selected_tubes, output_path):
-    masked_frames = apply_mask(frames, tubelets, selected_tubes)
+def visualize_spix(video_array, baseline_array, tubelets, selected_tubes, output_path):
+    masked_frames = apply_universal_mask(video_array, baseline_array, tubelets, selected_tubes)
     masked_frames[0].save(
         output_path, save_all=True, append_images=masked_frames[1:], duration=250, loop=0
     )
@@ -407,7 +401,7 @@ def visualize_interaction_matrix(interaction_matrix, output_path):
     plt.savefig(output_path, dpi=300)
     plt.close()
 
-def find_keywords(args, model, processor, input_ids, output_ids, frames, blur_frames, output_text, tokenizer=None, use_yake=False, special_ids=None):
+def find_keywords(args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, output_text, tokenizer=None, use_yake=False, special_ids=None):
     if special_ids is None:
         special_ids = []
     seq_len = output_ids.shape[-1]
@@ -442,7 +436,8 @@ def find_keywords(args, model, processor, input_ids, output_ids, frames, blur_fr
         else:
             full_prompt = torch.cat((input_ids, output_ids), dim=1)
             probs = get_token_probs(args, model, processor, full_prompt, output_ids, frames)
-            probs_blur = get_token_probs(args, model, processor, full_prompt, output_ids, blur_frames)
+            # CHANGED: Use the baseline_ins_frames here
+            probs_blur = get_token_probs(args, model, processor, full_prompt, output_ids, baseline_ins_frames)
             
             eps = 1e-7
             probs_safe = torch.clamp(probs, min=eps)
@@ -458,18 +453,18 @@ def find_keywords(args, model, processor, input_ids, output_ids, frames, blur_fr
             
     return positions, keywords
 
-def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_tubes, positions=None, num_steps=20):
+def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_tubes, ivd=0, positions=None, num_steps=20):
     eprint("\n--- Starting AUC Evaluation (Pixel-wise) ---")
     video_array = np.stack([np.array(img) for img in frames])
     T, H, W, C = video_array.shape
     num_pixels = T * H * W
     
-    blurred_video = precompute_blurred_video(video_array) # Blurred version for insertion
-    constant_video = np.zeros_like(video_array) # Pure black background for deletion
+    baseline_ins = get_baseline_insertion(args, video_array)
+    baseline_del = get_baseline_deletion(args, video_array)
     
-    # Baseline probabilities
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
-    prob_blur = get_prob(args, model, processor, full_ids, output_ids, [Image.fromarray(f) for f in blurred_video], positions)
+    frames_blur = [Image.fromarray(f) for f in baseline_ins]
+    prob_blur = get_prob(args, model, processor, full_ids, output_ids, frames_blur, positions)
     
     ins_curve = [prob_blur]
     del_curve = [prob_orig]
@@ -486,8 +481,10 @@ def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets,
     # 2. Add random noise to break ties within the tubelets.
     # Because noise is < 1.0, it never violates the ordering BETWEEN tubelets,
     # but it randomly shuffles the pixels WITHIN the same tubelet.
-    pixel_ranks += np.random.rand(T, H, W) * 0.5
-    
+    np.random.seed(args.manual_seed)
+    tubelet_noise = np.random.rand(int(tubelets.max()) + 1) * 0.5  
+    pixel_ranks += tubelet_noise[tubelets]
+
     # 3. Sort all pixels to find exact thresholds for our percentages
     sorted_ranks = np.sort(pixel_ranks, axis=None)[::-1] # Descending
     
@@ -504,13 +501,13 @@ def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets,
         mask_expanded = current_mask[..., np.newaxis] # Shape: (T, H, W, 1)
         
         # Insertion: Top pixels show original video, rest show blur
-        ins_array = np.where(mask_expanded, video_array, blurred_video).astype(np.uint8)
+        ins_array = np.where(mask_expanded, video_array, baseline_ins).astype(np.uint8)
         frames_ins = [Image.fromarray(f) for f in ins_array]
         p_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
         ins_curve.append(p_ins)
         
         # Deletion: Top pixels are blacked out, rest show original video
-        del_array = np.where(mask_expanded, constant_video, video_array).astype(np.uint8)
+        del_array = np.where(mask_expanded, baseline_del, video_array).astype(np.uint8)
         frames_del = [Image.fromarray(f) for f in del_array]
         p_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
         del_curve.append(p_del)
@@ -536,7 +533,7 @@ def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets,
     plt.grid(True)
     
     os.makedirs(args.output_dir, exist_ok=True)
-    plot_path = os.path.join(args.output_dir, "auc_curves.png")
+    plot_path = os.path.join(args.output_dir, f"{ivd}_auc_curves.png")
     plt.savefig(plot_path)
     plt.close()
     

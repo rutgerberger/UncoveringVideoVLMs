@@ -15,68 +15,80 @@ from transformers import VideoLlavaForConditionalGeneration, VideoLlavaProcessor
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 from utils import *
-from method import spix, apply_mask, spix_optimized, frame_redundancy
+from method import spix, spix_optimized, frame_redundancy
 from args import init_args
 
 DEFAULT_VIDEO_TOKEN = "<video>"
 MAX_VIDEOS = 5
 
+from dotenv import load_dotenv
+load_dotenv()
 
-def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tubelets, blur_frames, special_ids, 
+def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tubelets, baseline_ins_frames, special_ids, 
                      input_ids, output_ids, target_text, ivd, log_func, mode_name, file_prefix):
     """
-    Modular block that handles: Keyword Extraction -> SPIX -> Explicit Logging -> AUC Evaluation -> Visualization.
+    This block runs the following pipeline:
+        Keyword Extraction -> SPIX -> Explicit Logging -> AUC Evaluation -> Visualization.
+        
+    returns the auc metrics.
     """
     start = time.time()
+    # -- Finding Keywords and Probabilities
     eprint(f"{ivd+1}/{MAX_VIDEOS}: Selecting Important Tubelets ({mode_name}).")
-    
     positions, keywords = find_keywords(
-        args, model, processor, input_ids, output_ids, frames, blur_frames, 
+        args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, 
         target_text, tokenizer=tokenizer, use_yake=args.use_yake, special_ids=special_ids
     )
     log_func(f"[{mode_name}] Extracted Keywords: {keywords} at positions {positions}")
-
     full_ids = torch.cat((input_ids, output_ids), dim=1)
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
 
+    # -- Obtaining Tubelets
     final_tubelets, tubelet_scores = spix_optimized(
         args, model, processor, input_ids, output_ids, frames, tubelets,
         positions=positions, opt_mode=args.opt_mode, use_dynamic_lambda=args.use_dynamic_lambda
     )
 
-    # Calculate explicit probability drops for logging
-    frames_ins = apply_mask(frames, tubelets, final_tubelets)
+    # -- Baseline Videos: What Happens to Video \ Tubelets
+    baseline_ins = get_baseline_insertion(args, video_array)
+    baseline_del = get_baseline_deletion(args, video_array)
+    # -- Calculate explicit probability drops (logging purposes)
+    # Insertion: Foreground is original video, Background is baseline_ins
+    #TODO investigate this logic
+    frames_ins = apply_universal_mask(video_array, baseline_ins, tubelets, final_tubelets)
     prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
+    # Deletion: Foreground is original video, Background is baseline_del
     unique_tubes = np.unique(tubelets)
-    tubes_del = [t for t in unique_tubes if t not in final_tubelets]
-    frames_del = apply_mask(frames, tubelets, tubes_del)
+    tubes_to_keep = [t for t in unique_tubes if t not in final_tubelets]
+    frames_del = apply_universal_mask(video_array, baseline_del, tubelets, tubes_to_keep)
     prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
-
+    # -- Logging
     log_func(f"\n=== {mode_name} TUBELETS SEARCH LOG ===")
     log_func(f"Created tubelets in {time.time() - start:.2f}s")
     log_func(f"Final tubelets: {final_tubelets} ({len(final_tubelets)}/{len(unique_tubes)})")
     log_func(f"Prob Original: {prob_orig:.5f}")
     log_func(f"Prob Insertion: {prob_ins:.5f} (Diff: {prob_orig - prob_ins:.5f})")
     log_func(f"Prob Deletion: {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
-
+    # -- Metric calculation
     auc_ins, auc_del = evaluate_auc(
-        args, model, processor, full_ids, output_ids, frames, tubelets, final_tubelets, 
+        args, model, processor, full_ids, output_ids, frames, tubelets, final_tubelets, ivd=ivd,
         positions=positions, num_steps=20
     )
     log_func(f"[{mode_name}] AUC Insertion: {auc_ins:.4f}")
     log_func(f"[{mode_name}] AUC Deletion: {auc_del:.4f}")
-
+    # -- Saving gifs for visualization
     if getattr(args, 'save_visuals', True):
         eprint(f"{ivd+1}/{MAX_VIDEOS}: Visualizing the Masked Tubelets ({mode_name}).")
-        os.rename(os.path.join(args.output_dir, "auc_curves.png"), os.path.join(args.output_dir, f"{ivd}_{file_prefix}auc_curves.png"))
         tubes_to_vis = [t for t in unique_tubes if t not in final_tubelets]
-        visualize_spix(frames, tubelets, tubes_to_vis, os.path.join(args.output_dir, f"{ivd}_{file_prefix}mask.gif"))
+        visualize_spix(video_array, baseline_del, tubelets, tubes_to_vis, os.path.join(args.output_dir, f"{ivd}_{file_prefix}mask.gif"))
         visualize_heatmap(video_array, tubelets, tubelet_scores, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight.gif"))
         
     return auc_ins, auc_del
 
-
 def explain_vid(data, model, processor, args, tokenizer):
+    """
+    Holds the main loop with logging logic for method.
+    """
     now = datetime.datetime.now()
     setting = f'{now.month}{now.day}-{now.hour}{now.minute}'
     out_dir = os.path.join(args.output_dir, setting)
@@ -97,20 +109,21 @@ def explain_vid(data, model, processor, args, tokenizer):
         "auc_ins": [], "auc_del": [],
         "gt_auc_ins": [], "gt_auc_del": []
     }
-
+    # -- Main Loop - performs per given video
     for ivd in range(num_videos):
+        # -- Data Processing / Logging
         eprint(f"{ivd+1}/{num_videos}: Retrieving data.")
         start = time.time()
         row = data[ivd]
         frames, qs, cur_prompt, correct_idx = get_data(args, row)
-        log(f"\n\n=======================================================")
-        log(f"=== Question {ivd+1}/{num_videos} ===\n{qs}")
+        log(f"\n\n================================")
+        log(f"Question {ivd+1}/{num_videos} \n{qs}")
         eprint(f"Retrieved data in {time.time() - start}s")
-        
         if getattr(args, 'dataset', '') != 'imagenet':
             video_desc = create_description(args, model, processor, frames, tokenizer)
             log(f"Video Description: {video_desc}")
         
+        # -- Creation of Video Tubelets
         start = time.time()
         eprint(f"{ivd+1}/{num_videos}: Generating tubelets.")
         video_array, tubelets = generate_tubelets(frames, args)
@@ -126,31 +139,27 @@ def explain_vid(data, model, processor, args, tokenizer):
         log(f"Model Answer: {output_text}")
 
         # Precompute constants used for both standard and GT pipelines
-        blurred_video_np = precompute_blurred_video(video_array)
-        blur_frames = [Image.fromarray(f) for f in blurred_video_np]
+        baseline_ins = get_baseline_insertion(args, video_array)
+        baseline_ins_frames = [Image.fromarray(f) for f in baseline_ins]
         special_ids = [tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id]
         special_ids = [idx for idx in special_ids if idx is not None]
 
-        # ---------------------------------------------------------
-        # PIPELINE 1: STANDARD MODEL PREDICTION
-        # ---------------------------------------------------------
+        # -- First Step: Standard Evaluation on Given Answer
         auc_ins, auc_del = run_xai_pipeline(
-            args, model, processor, tokenizer, frames, video_array, tubelets, blur_frames, special_ids,
+            args, model, processor, tokenizer, frames, video_array, tubelets, baseline_ins_frames, special_ids,
             input_ids, output_ids, output_text, ivd, log, mode_name="STANDARD", file_prefix=""
         )
         global_metrics["auc_ins"].append(auc_ins)
         global_metrics["auc_del"].append(auc_del)
 
-        # ---------------------------------------------------------
-        # PIPELINE 2: GROUND TRUTH FORCING
-        # ---------------------------------------------------------
+        # -- Second Step: Evaluation on Ground Truth Tokens
         ground_truth = str(correct_idx)
         log(f"Ground Truth Label: {ground_truth}")
         gt_ids = tokenizer(ground_truth, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)
 
         if getattr(args, 'gt_forcing', False) and gt_ids is not None:    
             auc_ins_gt, auc_del_gt = run_xai_pipeline(
-                args, model, processor, tokenizer, frames, video_array, tubelets, blur_frames, special_ids,
+                args, model, processor, tokenizer, frames, video_array, tubelets, baseline_ins_frames, special_ids,
                 input_ids, gt_ids, ground_truth, ivd, log, mode_name="GROUND TRUTH", file_prefix="gt_"
             )
             global_metrics["gt_auc_ins"].append(auc_ins_gt)
@@ -200,10 +209,35 @@ if __name__ == "__main__":
                 merged_row = {**q, **a_dict[q['question_id']]}
                 data.append(merged_row)
     elif getattr(args, 'dataset', '') == 'imagenet':
-        dataset = load_dataset("ILSVRC/imagenet-1k", split="validation")
-        dataset = dataset.shuffle(seed=args.manual_seed).select(range(5000))
-        labels_feature = dataset.features['label']
-        data = [{'image': row['image'], 'label_name': labels_feature.int2str(row['label'])} for row in dataset]
+        os.makedirs(args.video_folder, exist_ok=True)
+        cache_path = os.path.join(args.video_folder, f"imagenet_5k_seed{args.manual_seed}.pkl")
+        # If we already downloaded it, load it instantly
+        if os.path.exists(cache_path):
+            eprint(f"Loading cached ImageNet subset from {cache_path}")
+            with open(cache_path, 'rb') as f:
+                data = pickle.load(f)
+        else:
+            eprint("Streaming ImageNet validation set from Hugging Face (skipping Train set)...")
+            # streaming=True is the magic word that skips the 150GB train download
+            dataset = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=True)
+            # Shuffle using a buffer. The validation set is 50k images.
+            n_images = 10
+            dataset = dataset.shuffle(seed=args.manual_seed, buffer_size=n_images*10).take(n_images)
+            # Extract the class label mapping from the dataset info
+            info = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=True).info
+            labels_feature = info.features['label']
+            data = []
+            eprint(f"Fetching {n_images} images... (This will take a few minutes)")
+            for i, row in enumerate(dataset):
+                data.append({
+                    'image': row['image'], 
+                    'label_name': labels_feature.int2str(row['label'])
+                })
+                if (i + 1) % 500 == 0:
+                    eprint(f"Fetched {i + 1}/5000 images...")
+            with open(cache_path, 'wb') as f:
+                pickle.dump(data, f)
+            eprint(f"Saved ImageNet subset to {cache_path}")
     elif args.data_path.endswith('csv'):
         df = pd.read_csv(args.data_path)
         data = df.to_dict(orient='records')
