@@ -5,6 +5,7 @@ import json
 import datetime
 import time
 import os
+import gc
 import pickle
 import random
 
@@ -15,7 +16,7 @@ from transformers import VideoLlavaForConditionalGeneration, VideoLlavaProcessor
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 from utils import *
-from method import spix_optimized, frame_redundancy
+from method import spix_gradient, spix_optimized, frame_redundancy
 from args import init_args
 
 DEFAULT_VIDEO_TOKEN = "<video>"
@@ -40,23 +41,27 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
         args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, 
         target_text, tokenizer=tokenizer, use_yake=args.use_yake, special_ids=special_ids
     )
-    log_func(f"[{mode_name}] Extracted Keywords: {keywords} at positions {positions}")
+    log_func(f"Extracted Keywords: {keywords} at positions {positions}")
     full_ids = torch.cat((input_ids, output_ids), dim=1)
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
 
     # -- Obtaining Tubelets
-    selected_ins, selected_del, scores_ins, scores_del = spix_optimized(
+    selected_ins, selected_del, scores_ins, scores_del = spix_gradient(
         args, model, processor, input_ids, output_ids, frames, tubelets,
         positions=positions
     )
 
     # -- Calculating Union and Intersection Masks
     unique_tubes = np.unique(tubelets)
-    selected_union = list(set(selected_ins) | set(selected_del))
-    selected_inter = list(set(selected_ins) & set(selected_del))
-    
-    scores_union = {t: max(scores_ins.get(t, 0), scores_del.get(t, 0)) for t in selected_union}
-    scores_inter = {t: min(scores_ins.get(t, 0), scores_del.get(t, 0)) for t in selected_inter}
+    raw_union = set(selected_ins) | set(selected_del)
+    raw_inter = set(selected_ins) & set(selected_del)
+    # Scores are calculated similarly
+    scores_union = {t: max(scores_ins.get(t, 0), scores_del.get(t, 0)) for t in raw_union}
+    scores_inter = {t: min(scores_ins.get(t, 0), scores_del.get(t, 0)) for t in raw_inter}
+
+    # Sort the lists descending by their new scores so evaluate_auc ranks them correctly
+    selected_union = sorted(list(raw_union), key=lambda t: scores_union[t], reverse=True)
+    selected_inter = sorted(list(raw_inter), key=lambda t: scores_inter[t], reverse=True)
 
     # -- Baseline Videos: What Happens to Video \ Tubelets
     baseline_ins = get_baseline_insertion(args, video_array)
@@ -73,7 +78,7 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
 
     # -- Logging
     log_func(f"\n=== {mode_name} TUBELETS SEARCH LOG ===")
-    log_func(f"Created tubelets in {time.time() - start:.2f}s")
+    log_func(f"Created tubelets in {(time.time() - start):.2f}s")
     log_func(f"Final Insertion tubelets: {selected_ins} ({len(selected_ins)}/{len(unique_tubes)})")
     log_func(f"Final Deletion tubelets: {selected_del} ({len(selected_del)}/{len(unique_tubes)})")
     log_func(f"Union mask size: {len(selected_union)} | Intersection mask size: {len(selected_inter)}")
@@ -95,8 +100,8 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     auc_ins_union, auc_del_union = evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_union, ivd=f"{ivd}_union", positions=positions, num_steps=20)
     auc_ins_inter, auc_del_inter = evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_inter, ivd=f"{ivd}_inter", positions=positions, num_steps=20)
     
-    log_func(f"[{mode_name}] AUC Union - Ins: {auc_ins_union:.4f} | Del: {auc_del_union:.4f}")
-    log_func(f"[{mode_name}] AUC Inter - Ins: {auc_ins_inter:.4f} | Del: {auc_del_inter:.4f}")
+    log_func(f"AUC Union - Ins: {auc_ins_union:.4f} | Del: {auc_del_union:.4f}")
+    log_func(f"AUC Inter - Ins: {auc_ins_inter:.4f} | Del: {auc_del_inter:.4f}")
 
     # -- Saving gifs for visualization
     if getattr(args, 'save_visuals', True):
@@ -148,8 +153,7 @@ def explain_vid(data, model, processor, args, tokenizer):
         start = time.time()
         row = data[ivd]
         frames, qs, cur_prompt, correct_idx = get_data(args, row)
-        log(f"\n\n================================")
-        log(f"Question {ivd+1}/{num_videos} \n{qs}")
+        log(f"\n\n=== Question {ivd+1}/{num_videos} ===\n{qs}")
         eprint(f"Retrieved data in {time.time() - start}s")
         if getattr(args, 'dataset', '') != 'imagenet':
             video_desc = create_description(args, model, processor, frames, tokenizer)
@@ -185,7 +189,7 @@ def explain_vid(data, model, processor, args, tokenizer):
 
         # -- Runs tubelet & visualization selection pipeline with ground truth answer
         ground_truth = str(correct_idx)
-        log(f"Ground Truth Label: {ground_truth}")
+        log(f"\n\n=== Ground Truth Label: {ground_truth} ===")
         gt_ids = tokenizer(ground_truth, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)
 
         if getattr(args, 'gt_forcing', False) and gt_ids is not None:    
@@ -197,6 +201,9 @@ def explain_vid(data, model, processor, args, tokenizer):
             global_metrics["gt_auc_del_union"].append(auc_del_union_gt)
             global_metrics["gt_auc_ins_inter"].append(auc_ins_inter_gt)
             global_metrics["gt_auc_del_inter"].append(auc_del_inter_gt)
+        # Garbage Collector
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # -- Final Aggregation Log
     with open(os.path.join(args.output_dir, 'final_metrics.json'), 'w') as f:

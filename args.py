@@ -40,13 +40,6 @@ def init_args():
     )
 
     parser.add_argument(
-        '--dataset_origin',
-        type=str,
-        default='TGIF',
-        choices=['HD-EPIC','TGIF','simple']
-    )
-
-    parser.add_argument(
         '--opt_mode',
         type=str,
         default='combined',

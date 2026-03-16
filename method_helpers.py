@@ -1,12 +1,18 @@
 from utils import *
 
 import numpy as np
-import cv2
-from scipy.ndimage import center_of_mass
-import yake
 import torch
 import torch.nn.functional as F
+import cv2
+
+import yake
 import heapq
+
+from scipy.ndimage import center_of_mass
+import torchvision.transforms.functional as TF 
+
+
+# -- For Lazy Greedy Search
 
 def initialize_lazy_greedy_queues(args, model, processor, full_ids, output_ids, video_array, tubelets, unique_tubes, baseline_ins, baseline_del, prob_orig, prob_base, positions):
     queue_ins = []
@@ -123,6 +129,316 @@ def run_lazy_greedy_search(args, model, processor, full_ids, output_ids,
                 break
                 
     return selected_tubes, tubelet_scores
+
+
+
+# For Gradient Based search
+
+def tv_norm_3d(mask, tv_beta=2):
+    """
+    Calculates the Total Variation loss for a 3D video mask.
+    mask shape expected: (Batch, Channels, Time, Height, Width)
+    """
+    # Temporal TV (Smoothness across frames)
+    tv_t = torch.mean(torch.abs(mask[:, :, 1:, :, :] - mask[:, :, :-1, :, :]).pow(tv_beta))
+    # Spatial TV Height (Smoothness vertically)
+    tv_h = torch.mean(torch.abs(mask[:, :, :, 1:, :] - mask[:, :, :, :-1, :]).pow(tv_beta))
+    # Spatial TV Width (Smoothness horizontally)
+    tv_w = torch.mean(torch.abs(mask[:, :, :, :, 1:] - mask[:, :, :, :, :-1]).pow(tv_beta))
+    
+    return tv_t + tv_h + tv_w
+
+
+def optimize_tubelet_weights(
+        args, model, processor, full_ids, output_ids, frames, baseline_frames, 
+        tubelets, positions, mode='deletion', iterations=60, lr=0.05, 
+        L1_lambda=0.05, TV_lambda=5.0, ig_steps=5
+    ):
+    """
+    Mode = deletion
+        Start with original video (?), goal is to find 
+        which pixels we need to remove to drop the
+        probabilities to 0.
+    Mode = insertion
+        Start with blurred video, goal is to find
+        which pixels we need to insert to increase
+        the probabilities.
+    """
+    num_tubes = int(tubelets.max()) + 1
+    #-- Initialization of masks \all X \in {-2.0,2.0} dependent on Deletion / Insertion
+    if mode == 'deletion': 
+        W_raw = torch.full((num_tubes,), 2.0, dtype=torch.float32, device=model.device, requires_grad=True)
+    else: 
+        W_raw = torch.full((num_tubes,), -2.0, dtype=torch.float32, device=model.device, requires_grad=True)
+    tubelets_tensor = torch.tensor(tubelets, device=model.device, dtype=torch.long) #For masking gradients
+    #-- Because we optimize w.r.t. output logits, we need tensors to contain computational graph
+    rgb_orig = torch.stack([TF.to_tensor(img.convert('RGB')) for img in frames]).to(model.device)
+    rgb_base = torch.stack([TF.to_tensor(img.convert('RGB')) for img in baseline_frames]).to(model.device)
+
+    # -- Figure out what the model expects by running the processor once (no gradients)
+    with torch.no_grad():
+        dummy_inputs = processor(text=" ", videos=frames, return_tensors="pt").to(model.device)
+        target_tensor_shape = dummy_inputs['pixel_values_videos'].shape
+        
+        # Dynamically handle (B, C, T, H, W) vs (B, T, C, H, W)
+        if target_tensor_shape[1] == 3: # (B, C, T, H, W)
+            target_C, target_T, target_H, target_W = target_tensor_shape[1:5]
+            t_dim_index = 2
+        else: # (B, T, C, H, W) -> standard for Hugging Face Video-LLaVA
+            target_T, target_C, target_H, target_W = target_tensor_shape[1:5]
+            t_dim_index = 1
+
+    #-- Model normalization constants (Standard OpenAI CLIP values used by LLaVA/Qwen)
+    mean_vals = [0.48145466, 0.4578275, 0.40821073]
+    std_vals = [0.26862954, 0.26130258, 0.27577711]
+    
+    # Adjust views so they align with the expected tensor format for broadcasting
+    if t_dim_index == 1:
+        mean = torch.tensor(mean_vals).view(1, 1, 3, 1, 1).to(model.device)
+        std = torch.tensor(std_vals).view(1, 1, 3, 1, 1).to(model.device)
+    else:
+        mean = torch.tensor(mean_vals).view(1, 3, 1, 1, 1).to(model.device)
+        std = torch.tensor(std_vals).view(1, 3, 1, 1, 1).to(model.device)
+    
+    optimizer = torch.optim.Adam([W_raw], lr=lr)
+    
+    #-- We take 'iterations' number of steps using IG
+    for i in range(iterations):
+        optimizer.zero_grad()
+        #-- Masking. Mask with tubelets, blend original video with baseline video
+        W = torch.sigmoid(W_raw)
+        M_high_res = W[tubelets_tensor] 
+        M_high_res = M_high_res.unsqueeze(1) #Insert new dimension: (T, H, W) --> (T, C, H, W)
+        blended_rgb = rgb_orig * M_high_res + rgb_base * (1.0 - M_high_res) # 'Real' space
+
+        #-- Moving to latent space
+        #   Take blended_rgb (created video tensor) and transform it into the
+        #   exact shape and format that the vision model expects for its
+        #   pixel_value_videos input
+        _, _, H_orig, W_orig = blended_rgb.shape
+        ratio = max(target_H / H_orig, target_W / W_orig)
+        new_H, new_W = int(H_orig * ratio), int(W_orig * ratio) # First we preserve the original aspect ratio
+        blended_resized = F.interpolate(blended_rgb, size=(new_H, new_W), mode='bilinear', align_corners=False)
+        crop_top = (new_H - target_H) // 2 #Here, we calculate starting pixel coordinates for the crop
+        crop_left = (new_W - target_W) // 2 #Find exact offset needed to trim an equal amount from both sides
+        blended_cropped = blended_resized[:, :, crop_top:crop_top+target_H, crop_left:crop_left+target_W] #Cut the video
+        blended_cropped = blended_cropped.permute(1, 0, 2, 3).unsqueeze(0) #(T,C,H,W) --> (1,C,T,H,W)
+        # F.interpolate (trilinear) ALWAYS expects (N, C, D, H, W), which is why we keep it as (1, C, T, H, W) here
+        if blended_cropped.shape[2] != target_T:
+            blended_cropped = F.interpolate(blended_cropped, size=(target_T, target_H, target_W), mode='trilinear', align_corners=False)
+        if t_dim_index == 1:
+            blended_cropped = blended_cropped.permute(0, 2, 1, 3, 4) # (1, C, T, H, W) -> (1, T, C, H, W)
+        pixels_final = (blended_cropped - mean) / std
+        
+        #-- Calculating regularizations (TV norm, L1 norm)
+        loss_tv = tv_norm_3d(M_high_res.unsqueeze(0), tv_beta=2)
+        loss_l1 = torch.mean(torch.abs(1.0 - W)) if mode == 'deletion' else torch.mean(torch.abs(W))
+        reg_loss = (L1_lambda * loss_l1) + (TV_lambda * loss_tv)
+        reg_loss.backward(retain_graph=True)  #-- Add these gradients to the computational graph already
+
+        #-- The main integrated gradients loop: sum the gradient over ~ig_steps
+        for step in range(1, ig_steps + 1):
+            #-- Forward the model with a blurred version (where mask is true) combined with the original version
+            alpha = step / ig_steps #The amount of 'blur'
+            pixels_interval = pixels_final * alpha + (dummy_inputs['pixel_values_videos'].detach() * (1.0 - alpha))
+            forward_kwargs = {
+                "input_ids": full_ids,
+                "attention_mask": torch.ones_like(full_ids).to(model.device), 
+                "pixel_values_videos": pixels_interval.to(dtype=model.dtype),
+                "use_cache": True
+            }
+            outputs = model(**forward_kwargs)
+
+            #-- Obtain probabilities
+            logits = outputs.logits 
+            out_len = output_ids.shape[-1]
+            target_logits = logits[:, -out_len - 1 : -1, :] 
+            probs = F.softmax(target_logits, dim=-1) 
+            target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+
+            #-- Filter on keyword positions
+            if positions is not None and len(positions) > 0:
+                target_probs = target_probs[0, positions] 
+            mean_prob = target_probs.mean()
+            log_prob = torch.log(mean_prob + 1e-7) # Steeper direction to take... (99.98 > 1.0 larger diff.)
+
+            #-- The goal is to maximize / minimize the log probs dependent on the mode
+            if mode == 'deletion':
+                main_loss = log_prob / ig_steps 
+            else:
+                main_loss = -log_prob / ig_steps  #We're optimizing towards INCREASING
+            
+            retain = (step < ig_steps)
+            main_loss.backward(retain_graph=retain) # Accumulates gradients across steps
+
+        optimizer.step()
+        if (i+1) % 10 == 0:
+            eprint(f"Iter {i+1}/{iterations} | TV: {loss_tv.item():.4f} | L1: {loss_l1.item():.4f}")
+
+    #-- Generate final output weights (for visualization and importance accounting)
+    final_weights = torch.sigmoid(W_raw).detach().cpu().numpy()
+    if mode == 'deletion':
+        scores = {t: 1.0 - w for t, w in enumerate(final_weights)}
+    else:
+        scores = {t: float(w) for t, w in enumerate(final_weights)}
+    threshold = 0.5 #-- Visualize only those that are 'important' enough
+    selected_tubelets = [t for t, s in scores.items() if s > threshold]
+    if len(selected_tubelets) == 0:
+        eprint(f"Warning: No tubelets crossed the {threshold} threshold. Falling back to top 10%.")
+        ranked_all = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
+        selected_tubelets = ranked_all[:max(1, int(num_tubes * 0.1))]
+        
+    return selected_tubelets, scores
+
+
+# def optimize_tubelet_weights(
+#             args, 
+#             model, 
+#             processor, 
+#             full_ids, 
+#             output_ids, 
+#             frames, 
+#             baseline_frames, 
+#             tubelets, 
+#             positions, 
+#             mode='deletion', 
+#             iterations=50, 
+#             lr=0.05, 
+#             L1_lambda=0.05
+#     ):
+#     """
+#     Alternative to run lazy greedy search.
+#         Instead of performing lazy greedy over a set,
+#         this function performs SGD over a vector of
+#         weights per tubelet. 
+
+#     Mode = deletion
+#         Start with original video, goal is to find 
+#         which pixels we need to remove to drop the
+#         probabilities to 0.
+
+#     Mode = insertion
+#         Start with blurred video, goal is to find
+#         which pixels we need to insert to increase
+#         the probabilities.
+#     """
+#     num_tubes = int(tubelets.max()) + 1
+    
+#     # -- Initialize Weights (based on mode)
+#     # 1. Initialize UNBOUNDED weights for Sigmoid
+#     if mode == 'deletion': 
+#         # sigmoid(2.0) ~ 0.88 (Starts mostly visible, pushing towards 0)
+#         W_raw = torch.full((num_tubes,), 2.0, dtype=torch.float32, device=model.device, requires_grad=True)
+#     else: 
+#         # sigmoid(-2.0) ~ 0.11 (Starts mostly blurred, pushing towards 1)
+#         W_raw = torch.full((num_tubes,), -2.0, dtype=torch.float32, device=model.device, requires_grad=True)
+
+#     # Keep tubelets at ORIGINAL resolution
+#     tubelets_tensor = torch.tensor(tubelets, device=model.device, dtype=torch.long)
+    
+#     # -- Pre-process frames into latent tensors (Done outside loop to save compute)
+#     inputs_orig = processor(text=" ", videos=frames, return_tensors="pt").to(model.device)
+#     inputs_base = processor(text=" ", videos=baseline_frames, return_tensors="pt").to(model.device)
+#     pixels_orig = inputs_orig['pixel_values_videos'].detach()
+#     pixels_base = inputs_base['pixel_values_videos'].detach()
+    
+#     # Assuming pixels_orig shape is: (Batch, Channels, Time, Height, Width)
+#     target_T = pixels_orig.shape[2]
+#     target_H = pixels_orig.shape[3]
+#     target_W = pixels_orig.shape[4]
+    
+#     optimizer = torch.optim.Adam([W_raw], lr=lr)
+    
+#     # -- Main Loop
+#     for i in range(iterations):
+#         optimizer.zero_grad()
+#         # -- Create Mask / Adjust dimensions
+#         # Pass through Sigmoid to get continuous [0, 1] weights
+#         W = torch.sigmoid(W_raw)
+#         # Map weights to the ORIGINAL high-res spatial dimensions
+#         M_high_res = W[tubelets_tensor] # Shape: (T_orig, H_orig, W_orig)
+#         # Add batch and channel dims for 3D interpolation -> (1, 1, T, H, W)
+#         M_high_res = M_high_res.unsqueeze(0).unsqueeze(0) 
+        
+#         # Trilinear interpolation - smooth mask boundaries
+#         M_expanded = F.interpolate(
+#             M_high_res, 
+#             size=(target_T, target_H, target_W), 
+#             mode='trilinear', 
+#             align_corners=False
+#         )
+        
+#         # -- Mix Tensors
+#         pixels_blended = pixels_orig * M_expanded + pixels_base * (1.0 - M_expanded)
+        
+#         # -- Differentiable Forward Pass
+#         forward_kwargs = {
+#             "input_ids": full_ids,
+#             "attention_mask": torch.ones_like(full_ids).to(model.device),
+#             "pixel_values_videos": pixels_blended.to(dtype=model.dtype),
+#             "use_cache": True
+#         }
+#         outputs = model(**forward_kwargs)
+        
+#         # -- Calculate target probability
+#         logits = outputs.logits 
+#         out_len = output_ids.shape[-1]
+#         target_logits = logits[:, -out_len - 1 : -1, :] 
+#         probs = F.softmax(target_logits, dim=-1) 
+#         target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+        
+#         if positions is not None and len(positions) > 0:
+#             target_probs = target_probs[0, positions] 
+    
+#         # -- Calculate Loss (specific to mode)
+#         # Log-Probabilities to prevent vanishing gradients
+#         mean_prob = target_probs.mean()
+#         log_prob = torch.log(mean_prob + 1e-7)
+        
+#         if mode == 'deletion':
+#             loss_main = log_prob # Minimize log probability (of keywords)
+#             loss_l1 = torch.mean(torch.abs(1.0 - W)) # Penalize W moving away from 1
+#         else:
+#             loss_main = -log_prob # Maximize log probability (of keywords)
+#             loss_l1 = torch.mean(torch.abs(W)) # Penalize W moving away from 0
+            
+#         total_loss = loss_main + (L1_lambda * loss_l1)
+        
+#         # -- Update weights
+#         total_loss.backward()
+#         optimizer.step()
+            
+#     # Detach and get final sigmoid weights
+#     final_weights = torch.sigmoid(W_raw).detach().cpu().numpy()
+    
+#     # -- Convert weights to scores
+#     if mode == 'deletion':
+#         # Invert weights for scoring (1.0 = highly important/deleted, 0.0 = ignored)
+#         scores = {t: 1.0 - w for t, w in enumerate(final_weights)}
+#     else:
+#         # Raw weights act as scores (1.0 = highly important/inserted, 0.0 = ignored)
+#         scores = {t: float(w) for t, w in enumerate(final_weights)}
+        
+#     # -- Binarize the continuous weights (Thresholding)
+#     # We consider a tubelet "selected" if the optimizer pushed its score past 0.5
+#     threshold = 0.5
+#     selected_tubelets = [t for t, s in scores.items() if s > threshold]
+    
+#     # -- Fallback Safety Net
+#     # If the L1 penalty was very aggressive and pushed everything below 0.5,
+#     # we fall back to selecting the top 10% of tubelets so the downstream pipeline doesn't crash.
+#     if len(selected_tubelets) == 0:
+#         eprint(f"Warning: No tubelets crossed the {threshold} threshold. Falling back to top 10%.")
+#         ranked_all = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
+#         selected_tubelets = ranked_all[:max(1, int(num_tubes * 0.1))]
+        
+#     return selected_tubelets, scores
+
+
+
+
+# -- For Distance Penalties
+
 
 
 

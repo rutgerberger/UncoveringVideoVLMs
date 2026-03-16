@@ -4,7 +4,6 @@ from method_helpers import *
 from PIL import Image
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 import heapq
 import random
@@ -59,7 +58,40 @@ def spix_optimized(args, model, processor, input_ids, output_ids, frames, tubele
     )
 
     return selected_ins, selected_del, scores_ins, scores_del
+
+
+def spix_gradient(args, model, processor, input_ids, output_ids, frames, tubelets, positions=None):
+    """
+    Optimizes two separate masks (Insertion and Deletion) simultaneously 
+    using Continuous Gradient Descent over Spatio-Temporal Tubelets.
+    """
+    video_array = np.stack([np.array(img) for img in frames])
+    full_ids = torch.cat((input_ids, output_ids), dim=1)
     
+    # -- Generate Baselines
+    baseline_ins = get_baseline_insertion(args, video_array) 
+    baseline_del = get_baseline_deletion(args, video_array)  
+    
+    # -- Convert numpy baselines to PIL for processor compatibility
+    frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
+    frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
+
+    # -- Run Insertion Optimization
+    eprint("\n--- Starting Continuous INSERTION Optimization ---")
+    selected_ins, scores_ins = optimize_tubelet_weights(
+        args, model, processor, full_ids, output_ids, frames, frames_ins_base, 
+        tubelets, positions, mode='insertion', iterations=50, lr=0.05, L1_lambda=0.2
+    )
+
+    # -- Run Deletion Optimization
+    eprint("\n--- Starting Continuous DELETION Optimization ---")
+    selected_del, scores_del = optimize_tubelet_weights(
+        args, model, processor, full_ids, output_ids, frames, frames_del_base, 
+        tubelets, positions, mode='deletion', iterations=50, lr=0.05, L1_lambda=0.2
+    )
+
+    return selected_ins, selected_del, scores_ins, scores_del
+
 def frame_redundancy(args, model, processor, input_ids, output_ids, frames, compute_interactions=True):
     """
     Calculates frame importance using Monte Carlo Shapley approximation 
