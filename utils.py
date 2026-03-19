@@ -339,30 +339,42 @@ def visualize_tubelets(video_array, tubelet_labels, output_path):
     )
     print(f"Saved visualization to {output_path}")
 
-def visualize_heatmap(video_array, tubelet_labels, tubelet_scores, output_path, alpha=0.5, blur_fraction=0.15, gamma=1.0):
+def visualize_heatmap(video_array, tubelet_labels, tubelet_scores, output_path, alpha=0.7, blur_fraction=0.15, gamma=1.0):
     visualized_video = []
     max_id = tubelet_labels.max()
     score_map = np.zeros(max_id + 1, dtype=np.float32)
-    for tid, score in tubelet_scores.items():
-        score_map[tid] = score
-    active_scores = score_map[score_map > 0]
     
+    # Clip negative scores to 0 (we only care about positive signal)
+    for tid, score in tubelet_scores.items():
+        score_map[tid] = max(0.0, score)
+        
+    # Normalize the scores so the maximum value is exactly 1.0
+    mask_max = score_map.max()
+    if mask_max > 0:
+        score_map = score_map / mask_max
+        
+    # Optional: Apply gamma to boost mid-tones if needed
+    #score_map = np.power(score_map, gamma)
     heatmap_mask = score_map[tubelet_labels]
-    mask_max = heatmap_mask.max()
-
     H, W = video_array[0].shape[:2]
     k_size = int(min(H, W) * blur_fraction)
     k_size = k_size + 1 if k_size % 2 == 0 else k_size 
     k_size = max(15, k_size) 
 
     for i in range(len(video_array)):
-        image = video_array[i]
+        image = video_array[i].astype(np.float32) # Ensure float for smooth blending
         mask_frame = heatmap_mask[i]
+        # Blur the 0-1 mask
         blurred_mask = cv2.GaussianBlur(mask_frame, (k_size, k_size), 0)
+        # Convert to 0-255 for the colormap
         heatmap_uint8 = np.uint8(255 * blurred_mask)
         heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-        overlay = (1.0 - alpha) * image + alpha * heatmap
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB).astype(np.float32)
+        # We scale the alpha by the blurred mask itself.
+        # Where the mask is 0, dynamic_alpha is 0 (100% original image).
+        # Where the mask is 1, dynamic_alpha is `alpha` (e.g., 60% heatmap, 40% image).
+        dynamic_alpha = blurred_mask[..., np.newaxis] * alpha
+        overlay = (1.0 - dynamic_alpha) * image + dynamic_alpha * heatmap
         overlay = np.clip(overlay, 0, 255).astype(np.uint8)
         visualized_video.append(Image.fromarray(overlay))
         
@@ -443,15 +455,25 @@ def find_keywords(args, model, processor, input_ids, output_ids, frames, baselin
             
     return positions, keywords
 
+
+## AUC CURVES ##
+
+
 def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_tubes, ivd=0, positions=None, num_steps=20):
+    """
+    To generate insertion and deletion curves, we gradually remove / delete pixels based on
+    the weight assigned within the framework earlier on. Tubelets with high importance
+    are removed earlier (greedy). Pixels within tubelets are randomly removed (smooth curves)
+    """
+
     eprint("\n--- Starting AUC Evaluation (Pixel-wise) ---")
     video_array = np.stack([np.array(img) for img in frames])
     T, H, W, C = video_array.shape
     num_pixels = T * H * W
     
+    #-- Get baseline videos to compare to
     baseline_ins = get_baseline_insertion(args, video_array)
     baseline_del = get_baseline_deletion(args, video_array)
-    
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
     frames_blur = [Image.fromarray(f) for f in baseline_ins]
     prob_blur = get_prob(args, model, processor, full_ids, output_ids, frames_blur, positions)
@@ -460,27 +482,23 @@ def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets,
     del_curve = [prob_orig]
     percentages = [0.0]
     
-    # 1. Create a dense pixel-level importance map
     pixel_ranks = np.zeros((T, H, W), dtype=np.float32)
     num_selected = len(selected_tubes)
-    
-    # Assign base scores: best tubelet gets highest score, unselected stay at 0
+  
+    #-- Assign base scores: best tubelet gets highest score, unselected stay at 0
+    #   selected_tubes is already sorted based on saliency
     for i, t_id in enumerate(selected_tubes):
         pixel_ranks[tubelets == t_id] = num_selected - i
         
-    # 2. Add random noise to break ties within the tubelets.
     # Because noise is < 1.0, it never violates the ordering BETWEEN tubelets,
     # but it randomly shuffles the pixels WITHIN the same tubelet.
     np.random.seed(args.manual_seed)
     tubelet_noise = np.random.rand(int(tubelets.max()) + 1) * 0.5  
     pixel_ranks += tubelet_noise[tubelets]
-
-    # 3. Sort all pixels to find exact thresholds for our percentages
     sorted_ranks = np.sort(pixel_ranks, axis=None)[::-1] # Descending
     
     for step in range(1, num_steps + 1):
         fraction = step / num_steps
-        
         # Find the rank threshold for this exact pixel percentage
         idx = int(fraction * num_pixels) - 1
         idx = max(0, min(idx, num_pixels - 1))
@@ -516,7 +534,7 @@ def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets,
     plt.axhline(y=prob_orig, color='gray', linestyle='--', label='Original Prob')
     plt.axhline(y=prob_blur, color='blue', linestyle='--', label='Blurred Prob')
     
-    plt.title(f"XAI Fidelity Curves (Mode: {getattr(args, 'opt_mode', 'combined')})")
+    plt.title(f"Insertion / Deletion Curves")
     plt.xlabel("Fraction of Total Video Pixels Revealed/Masked")
     plt.ylabel("Target Probability")
     plt.legend()
@@ -526,5 +544,78 @@ def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets,
     plot_path = os.path.join(args.output_dir, f"{ivd}_auc_curves.png")
     plt.savefig(plot_path)
     plt.close()
+    
+    return auc_ins, auc_del
+
+def evaluate_auc_pixel(args, model, processor, full_ids, output_ids, frames, continuous_mask, ivd=0, positions=None):
+    eprint("\n--- Starting iGOS AUC Evaluation (Reference Match) ---")
+    video_array = np.stack([np.array(img) for img in frames])
+    T, H, W, C = video_array.shape
+    num_pixels = T * H * W
+    
+    step = max(1, num_pixels // 50)
+    
+    baseline_ins = get_baseline_insertion(args, video_array)
+    baseline_del = get_baseline_deletion(args, video_array)
+    
+    og_scores = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
+    frames_blur = [Image.fromarray(f) for f in baseline_ins]
+    blur_scores = get_prob(args, model, processor, full_ids, output_ids, frames_blur, positions)
+    
+    # Curves track raw probabilities for plotting (just like the reference)
+    del_curve = [og_scores]
+    ins_curve = [blur_scores]
+    index = [0.0]
+    
+    del_scores_auc = 0.0
+    ins_scores_auc = 0.0
+    
+    # Broadcast and sort pixels
+    pixel_ranks = np.tile(continuous_mask, (T, 1, 1))
+    np.random.seed(args.manual_seed)
+    pixel_ranks += np.random.rand(*pixel_ranks.shape) * 1e-5
+    sorted_ranks = np.sort(pixel_ranks, axis=None)[::-1] 
+    
+    # Denominator for normalization
+    score_diff = (og_scores - blur_scores) if (og_scores - blur_scores) != 0 else 1e-7
+
+    for pixels in range(0, num_pixels, step):
+        # Calculate exactly how many pixels are evaluated in this step
+        current_step_size = step if pixels + step < num_pixels else num_pixels - pixels
+        
+        idx = min(pixels + current_step_size - 1, num_pixels - 1)
+        thresh = sorted_ranks[idx]
+        
+        current_mask = pixel_ranks >= thresh
+        mask_expanded = current_mask[..., np.newaxis] 
+        
+        # --- Deletion ---
+        del_array = np.where(mask_expanded, baseline_del, video_array).astype(np.uint8)
+        frames_del = [Image.fromarray(f) for f in del_array]
+        p_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
+        
+        del_curve.append(p_del) # Append raw score to curve
+        norm_del = (p_del - blur_scores) / score_diff # Normalize mathematically
+        del_scores_auc += norm_del * current_step_size # Accumulate area
+        
+        # --- Insertion ---
+        ins_array = np.where(mask_expanded, video_array, baseline_ins).astype(np.uint8)
+        frames_ins = [Image.fromarray(f) for f in ins_array]
+        p_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
+        
+        ins_curve.append(p_ins) # Append raw score to curve
+        norm_ins = (p_ins - blur_scores) / score_diff # Normalize mathematically
+        ins_scores_auc += norm_ins * current_step_size # Accumulate area
+        
+        index.append((pixels + current_step_size) / num_pixels)
+
+    # Force scores between 0 and 1 by dividing by total pixels
+    auc_del = del_scores_auc / num_pixels
+    auc_ins = ins_scores_auc / num_pixels
+
+    eprint(f"Final AUC - Insertion: {auc_ins:.4f} | Deletion: {auc_del:.4f}")
+    
+    # Generate the visual curves
+    save_curves(del_curve, ins_curve, index, auc_del, auc_ins, ivd, args.output_dir)
     
     return auc_ins, auc_del

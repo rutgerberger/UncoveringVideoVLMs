@@ -16,11 +16,14 @@ from transformers import VideoLlavaForConditionalGeneration, VideoLlavaProcessor
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 from utils import *
-from method import spix_gradient, spix_optimized, frame_redundancy
+from method import spix_gradient, spix_gradient_iterative, spix_optimized, frame_redundancy
 from args import init_args
 
+from iGOS.method import iGOS_p
+from utils import evaluate_auc_pixel
+
 DEFAULT_VIDEO_TOKEN = "<video>"
-MAX_VIDEOS = 5
+MAX_VIDEOS = 20
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -28,7 +31,7 @@ load_dotenv()
 def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tubelets, baseline_ins_frames, special_ids, 
                      input_ids, output_ids, target_text, ivd, log_func, mode_name, file_prefix):
     """
-    This block runs the following pipeline:
+    This runs the following pipeline:
         Keyword Extraction -> SPIX -> Explicit Logging -> AUC Evaluation -> Visualization.
 
     returns the auc metrics.
@@ -43,14 +46,46 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     )
     log_func(f"Extracted Keywords: {keywords} at positions {positions}")
     full_ids = torch.cat((input_ids, output_ids), dim=1)
+
+    if getattr(args, 'method', 'spix') == 'igos':
+        eprint("Running iGOS Continuous Pixel Optimization...")
+        baseline_ins = get_baseline_insertion(args, video_array)
+        frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
+        
+        # Unpack the exact tuple return
+        raw_mask, l_del, l_ins, l_l1, l_tv, l_l2, _, _ = iGOS_p(
+            args, model, processor, full_ids, output_ids, frames, frames_ins_base, positions,
+            lr=1000, L1=1, L2=1, L3=20, size=28 # Explicitly using original hyperparameters
+        )
+        
+        # Scale the raw mask up to video resolution for the evaluator
+        target_H, target_W = video_array.shape[1], video_array.shape[2]
+        up_mask = torch.nn.functional.interpolate(raw_mask.data, size=(target_H, target_W), mode='bilinear', align_corners=False)
+        igos_mask_numpy = up_mask.squeeze().cpu().numpy()
+        
+        # Evaluate using the pixel evaluator
+        auc_ins, auc_del = evaluate_auc_pixel(
+            args, model, processor, full_ids, output_ids, frames, igos_mask_numpy, 
+            ivd=ivd, positions=positions)#, num_steps=20
+        
+        #)
+        
+        log_func(f"iGOS Time: {(time.time() - start):.2f}s")
+        log_func(f"AUC iGOS - Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
+        
+        return auc_ins, auc_del, auc_ins, auc_del
+
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
 
     # -- Obtaining Tubelets
-    selected_ins, selected_del, scores_ins, scores_del = spix_gradient(
+    # selected_ins, selected_del, scores_ins, scores_del = spix_gradient(
+    #     args, model, processor, input_ids, output_ids, frames, tubelets,
+    #     positions=positions
+    # )
+    selected_ins, selected_del, scores_ins, scores_del = spix_gradient_iterative(
         args, model, processor, input_ids, output_ids, frames, tubelets,
-        positions=positions
+        positions=positions, stages=3, iters_per_stage=20
     )
-
     # -- Calculating Union and Intersection Masks
     unique_tubes = np.unique(tubelets)
     raw_union = set(selected_ins) | set(selected_del)
@@ -58,12 +93,11 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     # Scores are calculated similarly
     scores_union = {t: max(scores_ins.get(t, 0), scores_del.get(t, 0)) for t in raw_union}
     scores_inter = {t: min(scores_ins.get(t, 0), scores_del.get(t, 0)) for t in raw_inter}
-
     # Sort the lists descending by their new scores so evaluate_auc ranks them correctly
     selected_union = sorted(list(raw_union), key=lambda t: scores_union[t], reverse=True)
     selected_inter = sorted(list(raw_inter), key=lambda t: scores_inter[t], reverse=True)
 
-    # -- Baseline Videos: What Happens to Video \ Tubelets
+    # -- Baseline Videos: What Happens to video
     baseline_ins = get_baseline_insertion(args, video_array)
     baseline_del = get_baseline_deletion(args, video_array)
     
@@ -87,18 +121,8 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     log_func(f"Prob Deletion: {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
 
     # -- Metric calculation
-    # # Evaluate Insertion AUC using the insertion-optimized tubelets
-    # auc_ins, _ = evaluate_auc(
-    #     args, model, processor, full_ids, output_ids, frames, tubelets, selected_ins, 
-    #     ivd=f"{ivd}_ins", positions=positions, num_steps=20
-    # )
-    # # Evaluate Deletion AUC using the deletion-optimized tubelets
-    # _, auc_del = evaluate_auc(
-    #     args, model, processor, full_ids, output_ids, frames, tubelets, selected_del, 
-    #     ivd=f"{ivd}_del", positions=positions, num_steps=20
-    # )
-    auc_ins_union, auc_del_union = evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_union, ivd=f"{ivd}_union", positions=positions, num_steps=20)
-    auc_ins_inter, auc_del_inter = evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_inter, ivd=f"{ivd}_inter", positions=positions, num_steps=20)
+    auc_ins_union, auc_del_union = evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_union, ivd=f"{ivd}_union", positions=positions)#, num_steps=20)
+    auc_ins_inter, auc_del_inter = evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_inter, ivd=f"{ivd}_inter", positions=positions)#, num_steps=20)
     
     log_func(f"AUC Union - Ins: {auc_ins_union:.4f} | Del: {auc_del_union:.4f}")
     log_func(f"AUC Inter - Ins: {auc_ins_inter:.4f} | Del: {auc_del_inter:.4f}")
@@ -106,12 +130,10 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     # -- Saving gifs for visualization
     if getattr(args, 'save_visuals', True):
         eprint(f"{ivd+1}/{MAX_VIDEOS}: Visualizing the Masked Tubelets ({mode_name}).")
-        
-        # Original visualization behavior (using union mask as the default masking visual)
+        # Mask Visualization (using union mask as the default masking visual)
         keep_tubes_vis = [t for t in unique_tubes if t not in selected_union]
         visualize_spix(video_array, baseline_del, tubelets, keep_tubes_vis, os.path.join(args.output_dir, f"{ivd}_{file_prefix}mask_union.gif"))
-        
-        # 4 Heatmaps
+        # Heatmaps Vis
         visualize_heatmap(video_array, tubelets, scores_ins, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_ins.gif"))
         visualize_heatmap(video_array, tubelets, scores_del, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_del.gif"))
         visualize_heatmap(video_array, tubelets, scores_union, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_union.gif"))

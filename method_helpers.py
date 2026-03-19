@@ -12,6 +12,9 @@ from scipy.ndimage import center_of_mass
 import torchvision.transforms.functional as TF 
 
 
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
 # -- For Lazy Greedy Search
 
 def initialize_lazy_greedy_queues(args, model, processor, full_ids, output_ids, video_array, tubelets, unique_tubes, baseline_ins, baseline_del, prob_orig, prob_base, positions):
@@ -151,8 +154,7 @@ def tv_norm_3d(mask, tv_beta=2):
 
 def optimize_tubelet_weights(
         args, model, processor, full_ids, output_ids, frames, baseline_frames, 
-        tubelets, positions, mode='deletion', iterations=60, lr=0.05, 
-        L1_lambda=0.05, TV_lambda=5.0, ig_steps=5
+        tubelets, positions, mode='deletion'
     ):
     """
     Mode = deletion
@@ -200,10 +202,10 @@ def optimize_tubelet_weights(
         mean = torch.tensor(mean_vals).view(1, 3, 1, 1, 1).to(model.device)
         std = torch.tensor(std_vals).view(1, 3, 1, 1, 1).to(model.device)
     
-    optimizer = torch.optim.Adam([W_raw], lr=lr)
+    optimizer = torch.optim.Adam([W_raw], lr=args.lr)
     
-    #-- We take 'iterations' number of steps using IG
-    for i in range(iterations):
+    #-- We take 'args.iterations' number of steps using IG
+    for i in range(args.iterations):
         optimizer.zero_grad()
         #-- Masking. Mask with tubelets, blend original video with baseline video
         W = torch.sigmoid(W_raw)
@@ -231,15 +233,16 @@ def optimize_tubelet_weights(
         pixels_final = (blended_cropped - mean) / std
         
         #-- Calculating regularizations (TV norm, L1 norm)
-        loss_tv = tv_norm_3d(M_high_res.unsqueeze(0), tv_beta=2)
+        mask_for_tv = M_high_res.permute(1, 0, 2, 3).unsqueeze(0)
+        loss_tv = tv_norm_3d(mask_for_tv, tv_beta=2)
         loss_l1 = torch.mean(torch.abs(1.0 - W)) if mode == 'deletion' else torch.mean(torch.abs(W))
-        reg_loss = (L1_lambda * loss_l1) + (TV_lambda * loss_tv)
+        reg_loss = (args.L1_lambda * loss_l1) + (args.TV_lambda * loss_tv)
         reg_loss.backward(retain_graph=True)  #-- Add these gradients to the computational graph already
 
         #-- The main integrated gradients loop: sum the gradient over ~ig_steps
-        for step in range(1, ig_steps + 1):
+        for step in range(1, args.ig_steps + 1):
             #-- Forward the model with a blurred version (where mask is true) combined with the original version
-            alpha = step / ig_steps #The amount of 'blur'
+            alpha = step / args.ig_steps #The amount of 'blur'
             pixels_interval = pixels_final * alpha + (dummy_inputs['pixel_values_videos'].detach() * (1.0 - alpha))
             forward_kwargs = {
                 "input_ids": full_ids,
@@ -264,30 +267,44 @@ def optimize_tubelet_weights(
 
             #-- The goal is to maximize / minimize the log probs dependent on the mode
             if mode == 'deletion':
-                main_loss = log_prob / ig_steps 
+                main_loss = log_prob / args.ig_steps 
             else:
-                main_loss = -log_prob / ig_steps  #We're optimizing towards INCREASING
+                main_loss = -log_prob / args.ig_steps  #We're optimizing towards INCREASING
             
-            retain = (step < ig_steps)
+            retain = (step < args.ig_steps)
             main_loss.backward(retain_graph=retain) # Accumulates gradients across steps
 
         optimizer.step()
         if (i+1) % 10 == 0:
-            eprint(f"Iter {i+1}/{iterations} | TV: {loss_tv.item():.4f} | L1: {loss_l1.item():.4f}")
+            eprint(f"Iter {i+1}/{args.iterations} | TV: {loss_tv.item():.4f} | L1: {loss_l1.item():.4f}")
 
-    #-- Generate final output weights (for visualization and importance accounting)
+    # -- Generate final output weights
     final_weights = torch.sigmoid(W_raw).detach().cpu().numpy()
+    # Relative movement instead of absolute values (final evaluation)
     if mode == 'deletion':
-        scores = {t: 1.0 - w for t, w in enumerate(final_weights)}
+        init_w = sigmoid(2.0) # ~0.8808
+        scores = {t: float(init_w - w) for t, w in enumerate(final_weights)}
     else:
-        scores = {t: float(w) for t, w in enumerate(final_weights)}
-    threshold = 0.5 #-- Visualize only those that are 'important' enough
-    selected_tubelets = [t for t, s in scores.items() if s > threshold]
-    if len(selected_tubelets) == 0:
-        eprint(f"Warning: No tubelets crossed the {threshold} threshold. Falling back to top 10%.")
-        ranked_all = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
-        selected_tubelets = ranked_all[:max(1, int(num_tubes * 0.1))]
+        init_w = sigmoid(-2.0) # ~0.1192
+        scores = {t: float(w - init_w) for t, w in enumerate(final_weights)}
         
+    # Dynamic Thresholding (Relative to the strongest signal)
+    max_score = max(scores.values())
+    
+    # If the strongest signal moved at least a tiny bit
+    if max_score > 0.01: 
+        # We keep any tubelet that moved at least 20% as much as the most-moved tubelet
+        dynamic_threshold = max_score * 0.2
+        selected_tubelets = [t for t, s in scores.items() if s >= dynamic_threshold]
+    else:
+        selected_tubelets = []
+
+    # Fallback (Only if gradients completely died)
+    if len(selected_tubelets) == 0:
+        eprint(f"Warning: Model gradients were dead. Falling back to top 5%.")
+        ranked_all = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
+        selected_tubelets = ranked_all[:max(1, int(num_tubes * 0.05))]
+    #eprint(max_score, dynamic_threshold, selected_tubelets, scores)
     return selected_tubelets, scores
 
 
@@ -302,7 +319,7 @@ def optimize_tubelet_weights(
 #             tubelets, 
 #             positions, 
 #             mode='deletion', 
-#             iterations=50, 
+#             args.iterations=50, 
 #             lr=0.05, 
 #             L1_lambda=0.05
 #     ):
@@ -350,7 +367,7 @@ def optimize_tubelet_weights(
 #     optimizer = torch.optim.Adam([W_raw], lr=lr)
     
 #     # -- Main Loop
-#     for i in range(iterations):
+#     for i in range(args.iterations):
 #         optimizer.zero_grad()
 #         # -- Create Mask / Adjust dimensions
 #         # Pass through Sigmoid to get continuous [0, 1] weights
