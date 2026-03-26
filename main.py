@@ -63,6 +63,15 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
         up_mask = torch.nn.functional.interpolate(raw_mask.data, size=(target_H, target_W), mode='bilinear', align_corners=False)
         igos_mask_numpy = up_mask.squeeze().cpu().numpy()
         
+        if getattr(args, 'save_visuals', True):
+            eprint(f"{ivd+1}/{MAX_VIDEOS}: Saving iGOS Heatmaps...")
+            save_igos_heatmaps(
+                video_array, 
+                igos_mask_numpy, 
+                args.output_dir, 
+                prefix=f"{ivd}_{file_prefix}igos"
+            )
+
         # Evaluate using the pixel evaluator
         auc_ins, auc_del = evaluate_auc_pixel(
             args, model, processor, full_ids, output_ids, frames, igos_mask_numpy, 
@@ -184,7 +193,7 @@ def explain_vid(data, model, processor, args, tokenizer):
         # -- Creation of Video Tubelets
         start = time.time()
         eprint(f"{ivd+1}/{num_videos}: Generating tubelets.")
-        video_array, tubelets = generate_tubelets(frames, args)
+        video_array, tubelets = generate_tubelets_optimized(frames, args)
         eprint(f"Generated tubelets in {time.time() - start}s")
         
         # -- Gathering Original Model Output
