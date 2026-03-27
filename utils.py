@@ -1,6 +1,6 @@
+import os
 import torch
 import torch.nn.functional as F
-import os
 import cv2
 import time
 import sys
@@ -24,8 +24,32 @@ from io import BytesIO
 
 from qwen_vl_utils import process_vision_info
 
+import concurrent.futures
+
 DEFAULT_VIDEO_TOKEN = "<video>"
-NUM_FRAMES = 32
+NUM_FRAMES = 12
+
+def _run_slic_isolated(video_down_float, n_segments, compactness):
+    """
+    This runs in a completely separate OS process. 
+    PyTorch locks cannot reach here.
+    """
+    # Force single thread in the child process just to be absolutely safe
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    
+    from skimage.segmentation import slic
+    
+    return slic(
+        video_down_float, 
+        n_segments=n_segments,
+        compactness=compactness, 
+        channel_axis=-1, 
+        spacing=[2, 1, 1],
+        max_num_iter=4,              
+        enforce_connectivity=False   
+    )
 
 def eprint(*args, **kwargs):
     """Helper to log to stderr."""
@@ -104,12 +128,10 @@ def apply_universal_mask(foreground_array, background_array, tubelets, active_tu
 
 
 def get_data(args, row):
-    is_tgif = getattr(args, 'dataset', '') == 'TGIF'
-    is_imagenet = getattr(args, 'dataset', '') == 'imagenet'
     start_sec = 0
     end_sec = 1
     # -- ImageNet Data Handling
-    if is_imagenet:
+    if getattr(args, 'dataset', '') == 'imagenet':
         question_text = "If you were a classifier trained on ImageNet, what object is in this video? Answer with only the class name."
         cur_prompt = question_text
         options_prompt = ""
@@ -123,9 +145,9 @@ def get_data(args, row):
         eprint("================================")
         return video, qs, cur_prompt, correct_idx
     # -- It was not ImageNet. TGIF / SIMPLE dataset.
-    if is_tgif or getattr(args, 'dataset', '') == 'simple':
+    if getattr(args, 'dataset', '') == 'TGIF' or getattr(args, 'dataset', '') == 'simple':
         video_filename = f"{row['video_name']}.mp4" 
-        if is_tgif:
+        if getattr(args, 'dataset', '') == 'TGIF':
             video_path = os.path.join(args.video_folder, "mp4", video_filename)
         else:
             video_path = os.path.join(args.video_folder, video_filename)
@@ -134,6 +156,20 @@ def get_data(args, row):
         options_prompt = "N/A (Open-ended)"
         qs = cur_prompt + "\nAnswer with as few words as possible."
         correct_idx = row['answer']
+        apply_slice = False
+    elif getattr(args, 'dataset', '') == 'k400':
+        yt_id = row['youtube_id']
+        # K400 filenames pad the start and end times to 6 digits (e.g., 417 -> 000417)
+        start_time = str(row['time_start']).zfill(6)
+        end_time = str(row['time_end']).zfill(6)
+        video_filename = f"{yt_id}_{start_time}_{end_time}.mp4"
+        # Assumes videos are in /data/k400/val/
+        video_path = os.path.join(args.video_folder, "val", video_filename)
+        question_text = "What type of activity is happening in this video? Answer with only the action class name."
+        cur_prompt = question_text
+        options_prompt = "N/A (Open-ended)"
+        qs = cur_prompt
+        correct_idx = row['label']
         apply_slice = False
     # -- HD-EPIC handling
     else:
@@ -180,7 +216,9 @@ def get_data(args, row):
     eprint(f"Ground Truth: {correct_idx}")
     eprint("\n================================")
     return video, qs, cur_prompt, correct_idx
-    
+
+# -- Tubelet generation
+
 def generate_tubelets(video, args):
     video_array = np.stack([np.array(img) for img in video]) 
     T, H, W, C = video_array.shape
@@ -198,44 +236,92 @@ def generate_tubelets(video, args):
     return video_array, tubelet_labels
 
 def generate_tubelets_optimized(video, args, downsample_factor=0.5):
-    """
-    AI-generated function to optimize the SLIC clustering algorithm.
-    """
     video_array = np.stack([np.array(img) for img in video]) 
     T, H, W, C = video_array.shape
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     if getattr(args, 'use_slic', True):
-        # Downsampling: move to GPU, reshape to [Batch, Channels, Depth(T), Height, Width]
-        video_tensor = torch.from_numpy(video_array).permute(3, 0, 1, 2).unsqueeze(0).float().to(device)
-        down_H, down_W = int(H * downsample_factor), int(W * downsample_factor)
-        video_down = F.interpolate(video_tensor, size=(T, down_H, down_W), mode='trilinear', align_corners=False)
-        # And then retrieve back to CPU for skimage
-        video_for_slic = video_down.squeeze(0).permute(1, 2, 3, 0).cpu().numpy().astype(video_array.dtype)
-        # SLIC: fast because the volume is tiny and connectivity is off
-        tubelet_labels_down = slic(
-            video_for_slic, 
-            n_segments=120,              # Note: Within SWAG-V, it was found 120 is optimal for video
-            compactness=10, 
-            channel_axis=-1, 
-            spacing=[2, 1, 1],
-            max_num_iter=4,              # Relaxed convergence
-            enforce_connectivity=False   # Bypasses the slowest CPU step
-        )
-        # Upsampling on GPU: push labels back to GPU - [Batch, Channels, Depth, Height, Width]
-        labels_tensor = torch.from_numpy(tubelet_labels_down).unsqueeze(0).unsqueeze(0).float().to(device)
-        # We use 'nearest' so we don't blend integer class IDs (e.g., tubelet 1 and 3 don't become tubelet 2)
-        labels_up = F.interpolate(labels_tensor, size=(T, H, W), mode='nearest')
-        tubelet_labels = labels_up.squeeze().cpu().numpy().astype(int)
+        # 1. CPU Downsampling via OpenCV
+        if downsample_factor < 1.0:
+            down_H, down_W = int(H * downsample_factor), int(W * downsample_factor)
+            video_down = np.stack([
+                cv2.resize(frame, (down_W, down_H), interpolation=cv2.INTER_LINEAR) 
+                for frame in video_array
+            ])
+        else:
+            video_down = video_array.copy()
+
+        # Cast to float32 [0, 1] to keep the memory footprint tiny
+        video_down_float = (video_down.astype(np.float32) / 255.0)
+
+        # 2. SLIC Clustering in an ISOLATED PROCESS
+        n_seg = getattr(args, 'n_segments', 120)
+        comp = getattr(args, 'compactness', 10)
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
+            # Submit the job to the isolated process
+            future = executor.submit(_run_slic_isolated, video_down_float, n_seg, comp)
+            # This will wait for the child process to return the result
+            tubelet_labels_down = future.result() 
+        
+        # 3. CPU Upsampling via OpenCV
+        if downsample_factor < 1.0:
+            labels_uint16 = tubelet_labels_down.astype(np.uint16)
+            tubelet_labels = np.stack([
+                cv2.resize(label_frame, (W, H), interpolation=cv2.INTER_NEAREST) 
+                for label_frame in labels_uint16
+            ]).astype(int)
+        else:
+            tubelet_labels = tubelet_labels_down
+
     else:
-        # Fallback grid logic
         grid_size = 8
         y_indices = np.clip((np.arange(H) / (H / grid_size)).astype(int), 0, grid_size - 1)
         x_indices = np.clip((np.arange(W) / (W / grid_size)).astype(int), 0, grid_size - 1)
         grid_y, grid_x = np.meshgrid(y_indices, x_indices, indexing='ij')
         frame_labels = grid_y * grid_size + grid_x
         tubelet_labels = np.tile(frame_labels, (T, 1, 1))
+        
     return video_array, tubelet_labels
+
+# def generate_tubelets_optimized(video, args, downsample_factor=0.5):
+#     video_array = np.stack([np.array(img) for img in video]) 
+#     T, H, W, C = video_array.shape
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+#     if getattr(args, 'use_slic', True):
+#         # Downsampling: move to GPU, reshape to [Batch, Channels, Depth(T), Height, Width]
+#         video_tensor = torch.from_numpy(video_array).permute(3, 0, 1, 2).unsqueeze(0).float().to(device)
+#         down_H, down_W = int(H * downsample_factor), int(W * downsample_factor)
+#         video_down = F.interpolate(video_tensor, size=(T, down_H, down_W), mode='trilinear', align_corners=False)
+#         # And then retrieve back to CPU for skimage
+#         video_for_slic = video_down.squeeze(0).permute(1, 2, 3, 0).cpu().numpy().astype(video_array.dtype)
+#         # SLIC: fast because the volume is tiny and connectivity is off
+#         tubelet_labels_down = slic(
+#             video_for_slic, 
+#             n_segments=120,              # Note: Within SWAG-V, it was found 120 is optimal for video
+#             compactness=10, 
+#             channel_axis=-1, 
+#             spacing=[2, 1, 1],
+#             max_num_iter=4,              # Relaxed convergence
+#             enforce_connectivity=False   # Bypasses the slowest CPU step
+#         )
+#         # Upsampling on GPU: push labels back to GPU - [Batch, Channels, Depth, Height, Width]
+#         labels_tensor = torch.from_numpy(tubelet_labels_down).unsqueeze(0).unsqueeze(0).float().to(device)
+#         # We use 'nearest' so we don't blend integer class IDs (e.g., tubelet 1 and 3 don't become tubelet 2)
+#         labels_up = F.interpolate(labels_tensor, size=(T, H, W), mode='nearest')
+#         tubelet_labels = labels_up.squeeze().cpu().numpy().astype(int)
+#     else:
+#         # Fallback grid logic
+#         grid_size = 8
+#         y_indices = np.clip((np.arange(H) / (H / grid_size)).astype(int), 0, grid_size - 1)
+#         x_indices = np.clip((np.arange(W) / (W / grid_size)).astype(int), 0, grid_size - 1)
+#         grid_y, grid_x = np.meshgrid(y_indices, x_indices, indexing='ij')
+#         frame_labels = grid_y * grid_size + grid_x
+#         tubelet_labels = np.tile(frame_labels, (T, 1, 1))
+#     return video_array, tubelet_labels
+
+
+# -- VLM utils
 
 def generate_qwen(args, model, processor, prompt: str, frames):
     from qwen_vl_utils import process_vision_info
@@ -351,9 +437,7 @@ def create_description(args, model, processor, frames, tokenizer):
         _, _, description = generate(args, model, tokenizer, inputs)
     return description
 
-# =========================
-# Visualization Definitions
-# =========================
+# -- Visualization methods
 
 def save_igos_heatmaps(video_array, mask_numpy, outdir, prefix, alpha=0.5):
     """
@@ -488,6 +572,9 @@ def visualize_interaction_matrix(interaction_matrix, output_path):
     plt.savefig(output_path, dpi=300)
     plt.close()
 
+
+# -- Keyword finder (based on 'Where do VLMs look at')
+
 def find_keywords(args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, output_text, tokenizer=None, use_yake=False, special_ids=None):
     """
     Finds the words that change mostly when comparing to a baseline video.
@@ -544,37 +631,7 @@ def find_keywords(args, model, processor, input_ids, output_ids, frames, baselin
     return positions, keywords
 
 
-## AUC CURVES ##
-def save_curves(del_curve, ins_curve, index, auc_del, auc_ins, ivd, output_dir):
-    """
-    Plots and saves the Insertion and Deletion AUC curves.
-    """
-    # Extract baseline probabilities from the first index of the curves
-    prob_orig = del_curve[0]
-    prob_blur = ins_curve[0]
-
-    plt.figure(figsize=(8, 6))
-    
-    # Plot curves
-    plt.plot(index, ins_curve, label=f'Insertion (AUC={auc_ins:.3f})', color='green', marker='o')
-    plt.plot(index, del_curve, label=f'Deletion (AUC={auc_del:.3f})', color='red', marker='x')
-    
-    # Add horizontal reference lines
-    plt.axhline(y=prob_orig, color='gray', linestyle='--', label='Original Prob')
-    plt.axhline(y=prob_blur, color='blue', linestyle='--', label='Blurred Prob')
-    
-    # Formatting
-    plt.title("Insertion / Deletion Curves")
-    plt.xlabel("Fraction of Total Video Pixels Revealed/Masked")
-    plt.ylabel("Target Probability")
-    plt.legend()
-    plt.grid(True)
-    
-    # Save to directory
-    os.makedirs(output_dir, exist_ok=True)
-    plot_path = os.path.join(output_dir, f"{ivd}_auc_curves.png")
-    plt.savefig(plot_path)
-    plt.close()
+# -- AUC Curves
 
 def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_tubes, ivd=0, positions=None, num_steps=20):
     """
@@ -663,6 +720,42 @@ def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets,
     plt.close()
     
     return auc_ins, auc_del
+
+
+# -- For iGOS++
+
+def save_curves(del_curve, ins_curve, index, auc_del, auc_ins, ivd, output_dir):
+    """
+    Plots and saves the Insertion and Deletion AUC curves.
+    """
+    # Extract baseline probabilities from the first index of the curves
+    prob_orig = del_curve[0]
+    prob_blur = ins_curve[0]
+
+    plt.figure(figsize=(8, 6))
+    
+    # Plot curves
+    plt.plot(index, ins_curve, label=f'Insertion (AUC={auc_ins:.3f})', color='green', marker='o')
+    plt.plot(index, del_curve, label=f'Deletion (AUC={auc_del:.3f})', color='red', marker='x')
+    
+    # Add horizontal reference lines
+    plt.axhline(y=prob_orig, color='gray', linestyle='--', label='Original Prob')
+    plt.axhline(y=prob_blur, color='blue', linestyle='--', label='Blurred Prob')
+    
+    # Formatting
+    plt.title("Insertion / Deletion Curves")
+    plt.xlabel("Fraction of Total Video Pixels Revealed/Masked")
+    plt.ylabel("Target Probability")
+    plt.legend()
+    plt.grid(True)
+    
+    # Save to directory
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(output_dir, f"{ivd}_auc_curves.png")
+    plt.savefig(plot_path)
+    plt.close()
+
+
 
 def evaluate_auc_pixel(args, model, processor, full_ids, output_ids, frames, continuous_mask, ivd=0, positions=None):
     eprint("\n--- Starting iGOS AUC Evaluation (Reference Match) ---")

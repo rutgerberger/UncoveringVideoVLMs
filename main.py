@@ -16,14 +16,14 @@ from transformers import VideoLlavaForConditionalGeneration, VideoLlavaProcessor
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 from utils import *
-from method import spix_gradient, spix_gradient_iterative, spix_optimized, frame_redundancy
+from method import spix_gradient_iterative, frame_redundancy
 from args import init_args
 
 from iGOS.method import iGOS_p
 from utils import evaluate_auc_pixel
 
 DEFAULT_VIDEO_TOKEN = "<video>"
-MAX_VIDEOS = 20
+MAX_VIDEOS = 25
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -86,11 +86,7 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
 
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
 
-    # -- Obtaining Tubelets
-    # selected_ins, selected_del, scores_ins, scores_del = spix_gradient(
-    #     args, model, processor, input_ids, output_ids, frames, tubelets,
-    #     positions=positions
-    # )
+    # -- Main method is called here to acquire the selected tubelets and scores
     selected_ins, selected_del, scores_ins, scores_del = spix_gradient_iterative(
         args, model, processor, input_ids, output_ids, frames, tubelets,
         positions=positions, stages=3, iters_per_stage=20
@@ -182,6 +178,8 @@ def explain_vid(data, model, processor, args, tokenizer):
         # -- Data Processing / Logging
         eprint(f"{ivd+1}/{num_videos}: Retrieving data.")
         start = time.time()
+        id = random.randint(0, len(data) - 1)
+        ground_truth = data[id]['label']
         row = data[ivd]
         frames, qs, cur_prompt, correct_idx = get_data(args, row)
         log(f"\n\n=== Question {ivd+1}/{num_videos} ===\n{qs}")
@@ -201,6 +199,8 @@ def explain_vid(data, model, processor, args, tokenizer):
         prompt = f"USER: {DEFAULT_VIDEO_TOKEN}\n{qs}. ASSISTANT:"
         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
         log(f"Model Answer: {output_text}")
+        eprint(f"Model Answer: {output_text}")
+        log(f"Ground Truth Label: {ground_truth}")
 
         # -- Precompute constants used for both standard and GT pipelines
         baseline_ins = get_baseline_insertion(args, video_array)
@@ -220,7 +220,6 @@ def explain_vid(data, model, processor, args, tokenizer):
 
         # -- Runs tubelet & visualization selection pipeline with ground truth answer
         ground_truth = str(correct_idx)
-        log(f"\n\n=== Ground Truth Label: {ground_truth} ===")
         gt_ids = tokenizer(ground_truth, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)
 
         if getattr(args, 'gt_forcing', False) and gt_ids is not None:    
@@ -271,6 +270,7 @@ if __name__ == "__main__":
     for param in model.parameters():
         param.requires_grad = False
     model.gradient_checkpointing = True
+    eprint("Model Mapping:", model.hf_device_map)
 
     if getattr(args, 'dataset', '') == 'TGIF':
         q_path = os.path.join(args.data_path, 'test_q.json')

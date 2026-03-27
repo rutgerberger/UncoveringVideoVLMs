@@ -7,13 +7,13 @@ def init_args():
     )
 
     #Hyperparams to the method
-    parser.add_argument('--L1_lambda', type=float, default=0.05)
-    parser.add_argument('--TV_lambda', type=float, default=3.0)
-    parser.add_argument('--reg_lambda', type=float, default=0.5)
+    #parser.add_argument('--L1_lambda', type=float, default=0.05)
+    #parser.add_argument('--TV_lambda', type=float, default=3.0)
+    parser.add_argument('--reg_lambda', type=float, default=1.0)
     parser.add_argument('--lr', type=float, default=0.05)
     parser.add_argument('--ig_steps', type=int, default=5)
-    parser.add_argument('--stages', type=int, default=3)
-    parser.add_argument('--iterations', type=int, default=20)
+    parser.add_argument('--stages', type=int, default=4)
+    parser.add_argument('--iterations', type=int, default=15)
 
     parser.add_argument(
         '--model',

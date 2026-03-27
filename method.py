@@ -87,7 +87,9 @@ def spix_gradient_iterative(args, model, processor, input_ids, output_ids, frame
         current_video_del = np.where(mask, baseline_del, video_array)
 
     return list(accumulated_ins), list(accumulated_del), final_scores_ins, final_scores_del
-    
+
+
+
 def frame_redundancy(args, model, processor, input_ids, output_ids, frames, compute_interactions=True):
     """
     Calculates frame importance using Monte Carlo Shapley approximation 
