@@ -2,6 +2,9 @@ import os
 import torch
 import torch.nn.functional as F
 import cv2
+import gc
+cv2.setNumThreads(0)
+
 import time
 import sys
 import requests
@@ -126,10 +129,15 @@ def apply_universal_mask(foreground_array, background_array, tubelets, active_tu
     masked_array = np.where(mask, foreground_array, background_array).astype(np.uint8)
     return [Image.fromarray(f) for f in masked_array]
 
-
+    
 def get_data(args, row):
     start_sec = 0
     end_sec = 1
+    
+    # --- GLOBAL CAP --- 
+    # 384x384 keeps detail but strictly limits tokens to prevent OOM
+    max_dim = 384 
+
     # -- ImageNet Data Handling
     if getattr(args, 'dataset', '') == 'imagenet':
         question_text = "If you were a classifier trained on ImageNet, what object is in this video? Answer with only the class name."
@@ -138,12 +146,17 @@ def get_data(args, row):
         qs = cur_prompt
         correct_idx = row['label_name'].split(',')[0] 
         img = row['image'].convert('RGB')
+        
+        # Cap ImageNet resolution
+        img.thumbnail((max_dim, max_dim))
         video = [img for _ in range(NUM_FRAMES)]
+        
         eprint("================================")
         eprint(f"Question: {question_text}")
         eprint(f"Ground Truth: {correct_idx}")
         eprint("================================")
         return video, qs, cur_prompt, correct_idx
+        
     # -- It was not ImageNet. TGIF / SIMPLE dataset.
     if getattr(args, 'dataset', '') == 'TGIF' or getattr(args, 'dataset', '') == 'simple':
         video_filename = f"{row['video_name']}.mp4" 
@@ -157,13 +170,12 @@ def get_data(args, row):
         qs = cur_prompt + "\nAnswer with as few words as possible."
         correct_idx = row['answer']
         apply_slice = False
+        
     elif getattr(args, 'dataset', '') == 'k400':
         yt_id = row['youtube_id']
-        # K400 filenames pad the start and end times to 6 digits (e.g., 417 -> 000417)
         start_time = str(row['time_start']).zfill(6)
         end_time = str(row['time_end']).zfill(6)
         video_filename = f"{yt_id}_{start_time}_{end_time}.mp4"
-        # Assumes videos are in /data/k400/val/
         video_path = os.path.join(args.video_folder, "val", video_filename)
         question_text = "What type of activity is happening in this video? Answer with only the action class name."
         cur_prompt = question_text
@@ -171,6 +183,7 @@ def get_data(args, row):
         qs = cur_prompt
         correct_idx = row['label']
         apply_slice = False
+        
     # -- HD-EPIC handling
     else:
         video_input = row['inputs']['video 1']
@@ -202,20 +215,120 @@ def get_data(args, row):
     else:
         start_idx = 0
         end_idx = total_frames - 1
+        
     num_frames = NUM_FRAMES 
     video = []
+    
     if total_frames > 0 and end_idx > start_idx:
         indices = np.linspace(start_idx, end_idx - 1, num_frames).astype(int)
         batch_data = vr.get_batch(indices).asnumpy()
-        video = [Image.fromarray(frame) for frame in batch_data]
+        
+        # --- ROOT CAUSE FIX: Cap Video Frame Resolution ---
+        for frame in batch_data:
+            img = Image.fromarray(frame)
+            img.thumbnail((max_dim, max_dim))
+            video.append(img)
+            
     if getattr(args, 'random_shuffle', False):
         random.shuffle(video)
+        
     eprint("================================\n")
     eprint(f"Question: {question_text}")
     eprint(f"Options: {options_prompt}")
     eprint(f"Ground Truth: {correct_idx}")
     eprint("\n================================")
+    
     return video, qs, cur_prompt, correct_idx
+
+# def get_data(args, row):
+#     start_sec = 0
+#     end_sec = 1
+#     # -- ImageNet Data Handling
+#     if getattr(args, 'dataset', '') == 'imagenet':
+#         question_text = "If you were a classifier trained on ImageNet, what object is in this video? Answer with only the class name."
+#         cur_prompt = question_text
+#         options_prompt = ""
+#         qs = cur_prompt
+#         correct_idx = row['label_name'].split(',')[0] 
+#         img = row['image'].convert('RGB')
+#         video = [img for _ in range(NUM_FRAMES)]
+#         eprint("================================")
+#         eprint(f"Question: {question_text}")
+#         eprint(f"Ground Truth: {correct_idx}")
+#         eprint("================================")
+#         return video, qs, cur_prompt, correct_idx
+#     # -- It was not ImageNet. TGIF / SIMPLE dataset.
+#     if getattr(args, 'dataset', '') == 'TGIF' or getattr(args, 'dataset', '') == 'simple':
+#         video_filename = f"{row['video_name']}.mp4" 
+#         if getattr(args, 'dataset', '') == 'TGIF':
+#             video_path = os.path.join(args.video_folder, "mp4", video_filename)
+#         else:
+#             video_path = os.path.join(args.video_folder, video_filename)
+#         question_text = row['question']
+#         cur_prompt = question_text
+#         options_prompt = "N/A (Open-ended)"
+#         qs = cur_prompt + "\nAnswer with as few words as possible."
+#         correct_idx = row['answer']
+#         apply_slice = False
+#     elif getattr(args, 'dataset', '') == 'k400':
+#         yt_id = row['youtube_id']
+#         # K400 filenames pad the start and end times to 6 digits (e.g., 417 -> 000417)
+#         start_time = str(row['time_start']).zfill(6)
+#         end_time = str(row['time_end']).zfill(6)
+#         video_filename = f"{yt_id}_{start_time}_{end_time}.mp4"
+#         # Assumes videos are in /data/k400/val/
+#         video_path = os.path.join(args.video_folder, "val", video_filename)
+#         question_text = "What type of activity is happening in this video? Answer with only the action class name."
+#         cur_prompt = question_text
+#         options_prompt = "N/A (Open-ended)"
+#         qs = cur_prompt
+#         correct_idx = row['label']
+#         apply_slice = False
+#     # -- HD-EPIC handling
+#     else:
+#         video_input = row['inputs']['video 1']
+#         video_id = video_input['id']
+#         participant_id = video_id.split('-')[0]
+#         video_filename = f"{video_id}.mp4" 
+#         video_path = os.path.join(args.video_folder, participant_id, video_filename)
+#         question_text = row['question']
+#         choices_list = row['choices']
+#         correct_idx = row['correct_idx']
+#         options_prompt = ""
+#         for i, option in enumerate(choices_list):
+#             option_str = ", ".join(option) if isinstance(option, list) else str(option)
+#             options_prompt += f"\n{i}. {option_str}"
+#         cur_prompt = f"{question_text}{options_prompt}"
+#         qs = cur_prompt + "\nAnswer with only the INDEX of the correct answer."
+#         apply_slice = args.apply_slice
+#         if apply_slice:
+#             start_sec = timestamp_to_sec(video_input['start_time'])
+#             end_sec = timestamp_to_sec(video_input['end_time'])
+
+#     vr = VideoReader(video_path, ctx=cpu(0))
+#     fps = vr.get_avg_fps()
+#     total_frames = len(vr)
+#     if apply_slice:
+#         start_idx = int(round(start_sec * fps))
+#         end_idx = int(round(end_sec * fps))
+#         end_idx = min(end_idx, total_frames)
+#     else:
+#         start_idx = 0
+#         end_idx = total_frames - 1
+#     num_frames = NUM_FRAMES 
+#     video = []
+#     if total_frames > 0 and end_idx > start_idx:
+#         indices = np.linspace(start_idx, end_idx - 1, num_frames).astype(int)
+#         batch_data = vr.get_batch(indices).asnumpy()
+#         video = [Image.fromarray(frame) for frame in batch_data]
+#     if getattr(args, 'random_shuffle', False):
+#         random.shuffle(video)
+#     eprint("================================\n")
+#     eprint(f"Question: {question_text}")
+#     eprint(f"Options: {options_prompt}")
+#     eprint(f"Ground Truth: {correct_idx}")
+#     eprint("\n================================")
+#     return video, qs, cur_prompt, correct_idx
 
 # -- Tubelet generation
 
@@ -253,10 +366,9 @@ def generate_tubelets_optimized(video, args, downsample_factor=0.5):
         # Cast to float32 [0, 1] to keep the memory footprint tiny
         video_down_float = (video_down.astype(np.float32) / 255.0)
 
-        # 2. SLIC Clustering in an ISOLATED PROCESS
+        # We perform SLIC clustering in an isolated process (otherwise this would lead into deadlocks)
         n_seg = getattr(args, 'n_segments', 120)
         comp = getattr(args, 'compactness', 10)
-        
         with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
             # Submit the job to the isolated process
             future = executor.submit(_run_slic_isolated, video_down_float, n_seg, comp)
@@ -333,7 +445,7 @@ def generate_qwen(args, model, processor, prompt: str, frames):
     ]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
+    inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt", max_pixels=112896)
     inputs = inputs.to(model.device)
     with torch.no_grad():
         generated_ids = model.generate(**inputs, max_new_tokens=getattr(args, 'max_new_tokens', 128))
@@ -364,7 +476,7 @@ def get_model_response(args, model, processor, tokenizer, prompt, frames):
 
 def get_token_probs(args, model, processor, full_ids, output_ids, frames):
     if args.model == 'qwen':
-        inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt")
+        inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896)
     else:
         inputs = processor(text=" ", videos=frames, return_tensors="pt")
         
@@ -397,7 +509,7 @@ def get_token_probs(args, model, processor, full_ids, output_ids, frames):
 def get_prob(args, model, processor, full_ids, output_ids, frames, positions=None):
     """Calculates mean probability of the output_ids; optionally filtered by positions."""
     if args.model == 'qwen':
-        inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt")
+        inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896)
     else:
         inputs = processor(text=" ", videos=frames, return_tensors="pt")
     pixel_values = inputs['pixel_values_videos'].to(model.device, dtype=model.dtype)
@@ -632,95 +744,166 @@ def find_keywords(args, model, processor, input_ids, output_ids, frames, baselin
 
 
 # -- AUC Curves
-
-def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_tubes, ivd=0, positions=None, num_steps=20):
-    """
-    To generate insertion and deletion curves, we gradually remove / delete pixels based on
-    the weight assigned within the framework earlier on. Tubelets with high importance
-    are removed earlier (greedy). Pixels within tubelets are randomly removed (smooth curves)
-    """
-
-    eprint("\n--- Starting AUC Evaluation (Pixel-wise) ---")
-    video_array = np.stack([np.array(img) for img in frames])
-    T, H, W, C = video_array.shape
-    num_pixels = T * H * W
-    
-    #-- Get baseline videos to compare to
-    baseline_ins = get_baseline_insertion(args, video_array)
-    baseline_del = get_baseline_deletion(args, video_array)
-    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
-    frames_blur = [Image.fromarray(f) for f in baseline_ins]
-    prob_blur = get_prob(args, model, processor, full_ids, output_ids, frames_blur, positions)
-    
-    ins_curve = [prob_blur]
-    del_curve = [prob_orig]
-    percentages = [0.0]
-    
+def _compute_pixel_ranks(T, H, W, tubelets, selected_tubes, seed):
+    """AUC helper, computes pixel importance and adds smooth noise for AUC generation."""
     pixel_ranks = np.zeros((T, H, W), dtype=np.float32)
     num_selected = len(selected_tubes)
-  
-    #-- Assign base scores: best tubelet gets highest score, unselected stay at 0
-    #   selected_tubes is already sorted based on saliency
+    
     for i, t_id in enumerate(selected_tubes):
         pixel_ranks[tubelets == t_id] = num_selected - i
-        
-    # Because noise is < 1.0, it never violates the ordering BETWEEN tubelets,
-    # but it randomly shuffles the pixels WITHIN the same tubelet.
-    np.random.seed(args.manual_seed)
+    
+    np.random.seed(seed)
     tubelet_noise = np.random.rand(int(tubelets.max()) + 1) * 0.5  
     pixel_ranks += tubelet_noise[tubelets]
-    sorted_ranks = np.sort(pixel_ranks, axis=None)[::-1] # Descending
+    sorted_ranks = np.sort(pixel_ranks, axis=None)[::-1]
     
-    for step in range(1, num_steps + 1):
-        fraction = step / num_steps
-        # Find the rank threshold for this exact pixel percentage
-        idx = int(fraction * num_pixels) - 1
-        idx = max(0, min(idx, num_pixels - 1))
-        thresh = sorted_ranks[idx]
-        
-        # Create boolean mask for the top N% of pixels
-        current_mask = pixel_ranks >= thresh
-        mask_expanded = current_mask[..., np.newaxis] # Shape: (T, H, W, 1)
-        
-        # Insertion: Top pixels show original video, rest show blur
-        ins_array = np.where(mask_expanded, video_array, baseline_ins).astype(np.uint8)
-        frames_ins = [Image.fromarray(f) for f in ins_array]
-        p_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
-        ins_curve.append(p_ins)
-        
-        # Deletion: Top pixels are blacked out, rest show original video
-        del_array = np.where(mask_expanded, baseline_del, video_array).astype(np.uint8)
-        frames_del = [Image.fromarray(f) for f in del_array]
-        p_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
-        del_curve.append(p_del)
-        
-        percentages.append(fraction)
+    return pixel_ranks, sorted_ranks
 
-    # Compute AUC
-    auc_ins = auc(percentages, ins_curve)
-    auc_del = auc(percentages, del_curve)
-    eprint(f"Final Pixel AUC - Insertion: {auc_ins:.4f} | Deletion: {auc_del:.4f}")
+def _fast_tensor_forward(model, forward_kwargs, blended_pixels, output_ids, positions):
+    """AUC helper, runs optimized forward pass on the GPU."""
+    with torch.no_grad():
+        outputs = model(**forward_kwargs, pixel_values_videos=blended_pixels)
+        logits = outputs.logits[:, -output_ids.shape[-1] - 1 : -1, :]
+        probs = F.softmax(logits, dim=-1).gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+        
+        if probs.dim() == 0:
+            probs = probs.unsqueeze(0)
+        if positions is not None and len(positions) > 0:
+            probs = probs[0, positions]
+            
+        prob_val = probs.mean().item()
+        
+        del outputs, logits # Aggressive cache clearing
+        return prob_val
 
-    # Plot and Save
+def _plot_and_save_auc(percentages, ins_curve, del_curve, auc_ins, auc_del, prob_orig, prob_blur, output_dir, ivd):
+    """Handles matplotlib generation and disk I/O."""
     plt.figure(figsize=(8, 6))
     plt.plot(percentages, ins_curve, label=f'Insertion (AUC={auc_ins:.3f})', color='green', marker='o')
     plt.plot(percentages, del_curve, label=f'Deletion (AUC={auc_del:.3f})', color='red', marker='x')
     plt.axhline(y=prob_orig, color='gray', linestyle='--', label='Original Prob')
     plt.axhline(y=prob_blur, color='blue', linestyle='--', label='Blurred Prob')
     
-    plt.title(f"Insertion / Deletion Curves")
+    plt.title("Insertion / Deletion Curves")
     plt.xlabel("Fraction of Total Video Pixels Revealed/Masked")
     plt.ylabel("Target Probability")
     plt.legend()
     plt.grid(True)
     
-    os.makedirs(args.output_dir, exist_ok=True)
-    plot_path = os.path.join(args.output_dir, f"{ivd}_auc_curves.png")
-    plt.savefig(plot_path)
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, f"{ivd}_auc_curves.png"))
     plt.close()
-    
-    return auc_ins, auc_del
 
+def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_tubes, ivd=0, positions=None, num_steps=20):
+    eprint("\n--- Starting AUC Evaluation (Pixel-wise) ---")
+    video_array = np.stack([np.array(img) for img in frames])
+    T, H, W, _ = video_array.shape
+    num_pixels = T * H * W
+    
+    # Get baselines & calculate starting bounds
+    baseline_ins = get_baseline_insertion(args, video_array)
+    baseline_del = get_baseline_deletion(args, video_array)
+    frames_blur = [Image.fromarray(f) for f in baseline_ins]
+    frames_del_base = [Image.fromarray(f) for f in baseline_del]
+    
+    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
+    prob_blur = get_prob(args, model, processor, full_ids, output_ids, frames_blur, positions)
+    
+    # Compute pixel ranks and initialize curves
+    pixel_ranks, sorted_ranks = _compute_pixel_ranks(T, H, W, tubelets, selected_tubes, args.manual_seed)
+    ins_curve, del_curve, percentages = [prob_blur], [prob_orig], [0.0]
+    
+    # Pre-process Tensors to GPU
+    is_qwen = getattr(args, 'model', '') == 'qwen'
+    
+    if is_qwen:
+        orig_inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896)
+        blur_inputs = processor(text=[" "], videos=[frames_blur], padding=True, return_tensors="pt", max_pixels=112896)
+        del_inputs = processor(text=[" "], videos=[frames_del_base], padding=True, return_tensors="pt", max_pixels=112896)
+    else:
+        orig_inputs = processor(text=" ", videos=frames, return_tensors="pt")
+        blur_inputs = processor(text=" ", videos=frames_blur, return_tensors="pt")
+        del_inputs = processor(text=" ", videos=frames_del_base, return_tensors="pt")
+        
+    pixels_orig = orig_inputs['pixel_values_videos'].to(model.device, dtype=model.dtype).detach()
+    pixels_blur = blur_inputs['pixel_values_videos'].to(model.device, dtype=model.dtype).detach()
+    pixels_del_base = del_inputs['pixel_values_videos'].to(model.device, dtype=model.dtype).detach()
+    
+    # --- MODEL AGNOSTIC SHAPE EXTRACTION ---
+    target_shape = pixels_orig.shape
+    if is_qwen:
+        # Extract temporal and spatial grid from Qwen's metadata
+        grid_thw = orig_inputs['video_grid_thw'][0]
+        target_T, target_H, target_W = grid_thw[0].item(), grid_thw[1].item(), grid_thw[2].item()
+    else:
+        # Fallback to standard Video-LLaVA 5D extraction
+        if pixels_orig.dim() == 4:
+            pixels_orig = pixels_orig.unsqueeze(0)
+            pixels_blur = pixels_blur.unsqueeze(0)
+            pixels_del_base = pixels_del_base.unsqueeze(0)
+            target_shape = pixels_orig.shape
+            
+        t_dim_index, target_H, target_W = (2, target_shape[3], target_shape[4]) if target_shape[1] == 3 else (1, target_shape[3], target_shape[4])
+        
+    forward_kwargs = {"input_ids": full_ids, "attention_mask": torch.ones_like(full_ids).to(model.device), "use_cache": True}
+    if 'video_grid_thw' in orig_inputs:
+        forward_kwargs['video_grid_thw'] = orig_inputs['video_grid_thw'].to(model.device)
+        
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    # Evaluation Loop (Optimized)
+    for step in range(1, num_steps + 1):
+        now = time.time()
+        eprint(f"step {step}/{num_steps}")
+        fraction = step / num_steps
+        
+        idx = max(0, min(int(fraction * num_pixels) - 1, num_pixels - 1))
+        current_mask = pixel_ranks >= sorted_ranks[idx]
+        
+        # --- MODEL AGNOSTIC MASK INTERPOLATION ---
+        mask_tensor = torch.tensor(current_mask, dtype=torch.float32, device=model.device) # Shape: (T, H, W)
+        
+        if is_qwen:
+            # Format as 5D volume for trilinear interpolation: (1, 1, T, H, W)
+            mask_vol = mask_tensor.unsqueeze(0).unsqueeze(0)
+            mask_low_res_vol = F.interpolate(mask_vol, size=(target_T, target_H, target_W), mode='nearest')
+            # Flatten to 1D sequence to broadcast against Qwen's patch sequence
+            mask_low_res = mask_low_res_vol.view(-1, 1)
+        else:
+            # Format as (T, 1, H, W) for standard spatial interpolation
+            mask_spatial = mask_tensor.unsqueeze(1)
+            mask_low_res_base = F.interpolate(mask_spatial, size=(target_H, target_W), mode='nearest')
+            mask_low_res = mask_low_res_base.unsqueeze(0) if t_dim_index == 1 else mask_low_res_base.permute(1, 0, 2, 3).unsqueeze(0)
+
+        # GPU Blending
+        pixels_ins = pixels_orig * mask_low_res + pixels_blur * (1.0 - mask_low_res)
+        pixels_del = pixels_del_base * mask_low_res + pixels_orig * (1.0 - mask_low_res)
+        
+        # GPU Inference
+        ins_curve.append(_fast_tensor_forward(model, forward_kwargs, pixels_ins, output_ids, positions))
+        del_curve.append(_fast_tensor_forward(model, forward_kwargs, pixels_del, output_ids, positions))
+        percentages.append(fraction)
+        eprint(f"Done in {time.time() - now:.2f}s")
+
+        # Cleanup
+        del mask_tensor, mask_low_res
+        del pixels_ins, pixels_del
+        if is_qwen:
+            del mask_vol, mask_low_res_vol
+        else:
+            del mask_spatial, mask_low_res_base
+
+    # Final Metrics & Plotting
+    auc_ins, auc_del = auc(percentages, ins_curve), auc(percentages, del_curve)
+    eprint(f"Final Pixel AUC - Insertion: {auc_ins:.4f} | Deletion: {auc_del:.4f}")
+    _plot_and_save_auc(percentages, ins_curve, del_curve, auc_ins, auc_del, prob_orig, prob_blur, args.output_dir, ivd)
+    
+    del pixels_orig, pixels_blur, pixels_del_base
+    del orig_inputs, blur_inputs, del_inputs
+    torch.cuda.empty_cache()
+
+    return auc_ins, auc_del
 
 # -- For iGOS++
 

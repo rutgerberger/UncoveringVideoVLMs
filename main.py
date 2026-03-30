@@ -23,7 +23,7 @@ from iGOS.method import iGOS_p
 from utils import evaluate_auc_pixel
 
 DEFAULT_VIDEO_TOKEN = "<video>"
-MAX_VIDEOS = 25
+MAX_VIDEOS = 20
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -178,10 +178,12 @@ def explain_vid(data, model, processor, args, tokenizer):
         # -- Data Processing / Logging
         eprint(f"{ivd+1}/{num_videos}: Retrieving data.")
         start = time.time()
-        id = random.randint(0, len(data) - 1)
-        ground_truth = data[id]['label']
-        row = data[ivd]
-        frames, qs, cur_prompt, correct_idx = get_data(args, row)
+        id = random.randint(0,len(data)-1)
+        row = data[id]
+        try:
+            frames, qs, cur_prompt, correct_idx = get_data(args, row)
+        except:
+            continue
         log(f"\n\n=== Question {ivd+1}/{num_videos} ===\n{qs}")
         eprint(f"Retrieved data in {time.time() - start}s")
         if getattr(args, 'dataset', '') != 'imagenet':
@@ -200,7 +202,6 @@ def explain_vid(data, model, processor, args, tokenizer):
         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
         log(f"Model Answer: {output_text}")
         eprint(f"Model Answer: {output_text}")
-        log(f"Ground Truth Label: {ground_truth}")
 
         # -- Precompute constants used for both standard and GT pipelines
         baseline_ins = get_baseline_insertion(args, video_array)
@@ -221,6 +222,7 @@ def explain_vid(data, model, processor, args, tokenizer):
         # -- Runs tubelet & visualization selection pipeline with ground truth answer
         ground_truth = str(correct_idx)
         gt_ids = tokenizer(ground_truth, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)
+        log(f"Ground Truth Label: {ground_truth}")
 
         if getattr(args, 'gt_forcing', False) and gt_ids is not None:    
             auc_ins_union_gt, auc_del_union_gt, auc_ins_inter_gt, auc_del_inter_gt = run_xai_pipeline(
