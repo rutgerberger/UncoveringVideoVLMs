@@ -98,7 +98,6 @@ def _get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, 
         if is_qwen:
             dummy_inputs_orig = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896).to(model.device)
             dummy_inputs_base = processor(text=[" "], videos=[baseline_frames], padding=True, return_tensors="pt", max_pixels=112896).to(model.device)
-            
             pixels_orig = dummy_inputs_orig['pixel_values_videos'].detach()
             pixels_base = dummy_inputs_base['pixel_values_videos'].detach()
             
@@ -107,7 +106,6 @@ def _get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, 
         else:
             dummy_inputs_orig = processor(text=" ", videos=frames, return_tensors="pt").to(model.device)
             dummy_inputs_base = processor(text=" ", videos=baseline_frames, return_tensors="pt").to(model.device)
-            
             pixels_orig = dummy_inputs_orig['pixel_values_videos'].detach()
             pixels_base = dummy_inputs_base['pixel_values_videos'].detach()
             
@@ -119,19 +117,18 @@ def _get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, 
                 target_T, target_C, target_H, target_W = target_tensor_shape[1:5]
                 t_dim_index = 1
 
-    # --- THE CROP FIX: Precalculate exact HF geometry scaling ---
+    #-- Cropping: Precalculate exact HF geometry scaling
     T_orig, H_orig, W_orig = tubelets.shape
     ratio = max(target_H / float(H_orig), target_W / float(W_orig))
     new_H, new_W = int(H_orig * ratio), int(W_orig * ratio)
     crop_top = (new_H - target_H) // 2
     crop_left = (new_W - target_W) // 2
 
-    #dummy_inputs_base is never used?
-    return dummy_inputs_orig, dummy_inputs_base, pixels_orig, pixels_base, target_T, target_H, target_W, t_dim_index, crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig
+    return dummy_inputs_orig, pixels_orig, pixels_base, target_T, target_H, target_W, t_dim_index, crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig
 
 
 
-def _calculate_gradient(model, W_raw, pixels_interval, full_ids, 
+def _calculate_gradient(model, tokenizer, W_raw, pixels_interval, full_ids, 
                           output_ids, positions, mode, args, 
                           is_qwen, dummy_inputs_orig, reg_grads):
     """
@@ -167,14 +164,19 @@ def _calculate_gradient(model, W_raw, pixels_interval, full_ids,
         "use_cache": False
     }
     if is_qwen:
-         forward_kwargs["video_grid_thw"] = dummy_inputs_orig["video_grid_thw"]
+        forward_kwargs["video_grid_thw"] = dummy_inputs_orig["video_grid_thw"]
     
     outputs = model(**forward_kwargs)
 
     #-- Define the objective probabilities
-    logits = outputs.logits 
+    logits = outputs.logits
     out_len = output_ids.shape[-1]
-    target_logits = logits[:, -out_len - 1 : -1, :] 
+    target_logits = logits[:, -out_len - 1 : -1, :]
+    predicted_ids = torch.argmax(target_logits, dim=-1)
+
+    predicted_text = tokenizer.decode(predicted_ids[0], skip_special_tokens=True)
+    target_text = tokenizer.decode(output_ids[0], skip_special_tokens=True) # Assuming batch is 1
+
     probs = F.softmax(target_logits, dim=-1) 
     target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
     if positions is not None and len(positions) > 0:
@@ -199,15 +201,18 @@ def _calculate_gradient(model, W_raw, pixels_interval, full_ids,
     torch.cuda.empty_cache()
     gc.collect()
 
-    return real_grads.copy()
+    return predicted_text, target_text, real_grads.copy()
     
 def optimize_tubelet_weights(
-        args, model, processor, full_ids, output_ids, frames, baseline_frames, 
+        args, model, tokenizer, processor, full_ids, output_ids, frames, baseline_frames, 
         tubelets, positions, mode='deletion', stage="init"
     ):
     """
     Gradually move the weights of the tubelets 
     to optimize the insertion / deletion loss.
+    
+    deletion: baseline_frames constant
+    insertion: baseline_frames constant/blurred
     """
 
     #-- Initialize the raw weight tensor <-inf, inf>
@@ -222,8 +227,7 @@ def optimize_tubelet_weights(
     
     #-- Efficiently obtain required inputs for the model and resizing factors (for downscaling)
     packed_inputs = _get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, tubelets)
-    
-    (dummy_inputs_orig, dummy_inputs_base, pixels_orig, pixels_base,
+    (dummy_inputs_orig, pixels_orig, pixels_base,
      target_T, target_H, target_W, t_dim_index,
      crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig) = packed_inputs
     
@@ -266,20 +270,57 @@ def optimize_tubelet_weights(
                 M_high_res_step, new_H, new_W, crop_top, crop_left, 
                 target_H, target_W, target_T, T_orig, is_qwen, t_dim_index
             )
-            #Get pixel values
+            # Get pixel values
+            #
+            # pixels_orig : original video (video)
+            # pixels_base : baseline (constant video, or blurred)
+            # pixels_final is a mix:
+            #   M_low_res_step==
+            #                Rescaled mask to work on the model's input space.
+            #                This gives values between 0 and 1
+            #   If M == 1: we see the complete original video
+            #   If M == 0: we see the baseline video
+            #
+            # For deletion, the mask is initialized around 0.9.
+            #   the first round, pixels_final = a slightly less bright original video
+            #   the situation we are aiming at: 
+            #       'decrease the weights at important parts'
+            #        --> this leads to 'hiding' parts of the original input
+            #        --> and introducing 'constant' parts which do not tell us much
+            #   say the second round, some weights have decreased --> see above
+            #
+            # The end-point of the IG path shows this masked video
+            #       the start-point should show a completely visible video
+            #       shouldn't this be a path from a constant video as well?
+            #       why do we do original video inside interval?
+            # 
+            # The IG Baseline (alpha = 0): This is the starting state of the Integrated Gradients integral. 
+            # In IG, the baseline represents the state of "zero intervention" or the reference state before
+            # your current parameters take effect.
+            #
+            # For the deletion metric, the primary objective is to find out which tubelets, when removed,
+            # destroy the model's confidence the fastest
+            #
+            # Start of Path (alpha=0): pixels_orig (The completely unmasked video).
+            # This is the "zero intervention" state where the mask has not been applied yet. 
+            # The model is fully confident.
+            #
+            # End of Path (alpha=1): pixels_final (The video with your current mask M applied,
+            # where areas with low weights are replaced by pixels_base).
+            #
+            # Likewise for insertion
+
             pixels_final = pixels_orig * M_low_res_step + pixels_base * (1.0 - M_low_res_step)
             if mode == 'deletion':
-                # Path: Original (0) -> Masked (1). We measure the DROP from original context.
                 pixels_interval = pixels_final * alpha + pixels_orig * (1.0 - alpha)
             else:
-                # Path: Blurred (0) -> Revealed (1). We measure the GAIN from zero context.
                 pixels_interval = pixels_final * alpha + pixels_base * (1.0 - alpha)
             
-            real_grads = _calculate_gradient(model, W_raw, pixels_interval, full_ids, 
+            predicted_text, target_text, real_grads = _calculate_gradient(model, tokenizer, W_raw, pixels_interval, full_ids, 
                           output_ids, positions, mode, args, 
                           is_qwen, dummy_inputs_orig, reg_grads)
 
-            if i % 5 == 0:  # For debugging
+            if i % 5 == 0:  # For debugging and logging
                 save_folder = os.path.join(args.output_dir, f'gradients/{stage}')
                 os.makedirs(save_folder, exist_ok=True)
 
@@ -315,6 +356,7 @@ def optimize_tubelet_weights(
                     faded_hr_frames.append(np.clip(faded_f, 0, 255).astype(np.uint8))
 
                 # Visualize how the gradients exactly look like at this interval
+                eprint(f"Stage {stage} Iter {i+1}: Predicted {predicted_text} | Target {target_text}")
                 visualize_gradients(
                     gradients=real_grads, 
                     frames=faded_hr_frames, 
@@ -349,7 +391,7 @@ def optimize_tubelet_weights(
         
     max_score = max(scores.values())
     if max_score > 0.01: 
-        dynamic_threshold = max_score * 0.2
+        dynamic_threshold = max_score * 0.5
         selected_tubelets = [t for t, s in scores.items() if s >= dynamic_threshold]
     else:
         selected_tubelets = []
@@ -363,7 +405,7 @@ def optimize_tubelet_weights(
 
     # --- FUNCTION EXIT CLEANUP ---
     del pixels_orig, pixels_base
-    del dummy_inputs_orig, dummy_inputs_base
+    del dummy_inputs_orig
     del optimizer, W_raw
     torch.cuda.empty_cache()
     gc.collect()

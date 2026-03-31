@@ -110,6 +110,7 @@ def get_baseline_insertion(args, video_array):
 
 def get_baseline_deletion(args, video_array):
     """Returns the masking canvas used for Deletion metrics (White)."""
+    #return np.zeros_like(video_array)
     return np.full_like(video_array, 255) # Constant white video
 
 def apply_universal_mask(foreground_array, background_array, tubelets, active_tubes):

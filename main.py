@@ -88,7 +88,7 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
 
     # -- Main method is called here to acquire the selected tubelets and scores
     selected_ins, selected_del, scores_ins, scores_del = spix_gradient_iterative(
-        args, model, processor, input_ids, output_ids, frames, tubelets,
+        args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets,
         positions=positions, stages=3, iters_per_stage=20, index=ivd
     )
     # -- Calculating Union and Intersection Masks
@@ -252,6 +252,7 @@ def explain_vid(data, model, processor, args, tokenizer):
     eprint(f"\nExperiment Complete. Mean metrics saved to {args.output_dir}/final_metrics.json")
 
 if __name__ == "__main__":
+    eprint("Hello world")
     args = init_args()
     eprint(f"args:\n {args}")
 

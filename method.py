@@ -10,7 +10,7 @@ import random
 import itertools
 
 
-def spix_gradient_iterative(args, model, processor, input_ids, output_ids, frames, tubelets, positions=None, stages=3, iters_per_stage=20, index=1):
+def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None, stages=3, iters_per_stage=20, index=1):
     """
     Optimize two separate masks. 'Whack-a-Mole Optimization'
         - We run gradient descent in multiple stages (with args.iterations per stage)
@@ -40,7 +40,7 @@ def spix_gradient_iterative(args, model, processor, input_ids, output_ids, frame
         
         # -- Main Weight Optimization Loop
         selected, scores = optimize_tubelet_weights(
-            args, model, processor, full_ids, output_ids, frames, frames_ins_base, 
+            args, model, tokenizer, processor, full_ids, output_ids, frames, frames_ins_base, 
             tubelets, positions, mode='insertion', stage=f"{index}-{stage}-insertion") 
 
         # -- Evaluation. Record highest score a tubelet achieved across all stages
@@ -69,7 +69,7 @@ def spix_gradient_iterative(args, model, processor, input_ids, output_ids, frame
 
         # -- Main Weight Optimization Loop
         selected, scores = optimize_tubelet_weights(
-            args, model, processor, full_ids, output_ids, frames_current_video, frames_del_base, 
+            args, model, tokenizer, processor, full_ids, output_ids, frames_current_video, frames_del_base, 
             tubelets, positions, mode='deletion', stage=f"{index}-{stage}-deletion")
 
         # -- Evaluation. Record highest score a tubelet achieved across all stages
