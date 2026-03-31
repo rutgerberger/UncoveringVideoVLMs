@@ -39,7 +39,7 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     start = time.time()
     
     # -- Finding Keywords and Probabilities
-    eprint(f"{ivd+1}/{MAX_VIDEOS}: Selecting Important Tubelets ({mode_name}).")
+    eprint(f"{ivd+1}/{args.num_videos}: Selecting Important Tubelets ({mode_name}).")
     positions, keywords = find_keywords(
         args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, 
         target_text, tokenizer=tokenizer, use_yake=args.use_yake, special_ids=special_ids
@@ -64,7 +64,7 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
         igos_mask_numpy = up_mask.squeeze().cpu().numpy()
         
         if getattr(args, 'save_visuals', True):
-            eprint(f"{ivd+1}/{MAX_VIDEOS}: Saving iGOS Heatmaps...")
+            eprint(f"{ivd+1}/{args.num_videos}: Saving iGOS Heatmaps...")
             save_igos_heatmaps(
                 video_array, 
                 igos_mask_numpy, 
@@ -89,7 +89,7 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     # -- Main method is called here to acquire the selected tubelets and scores
     selected_ins, selected_del, scores_ins, scores_del = spix_gradient_iterative(
         args, model, processor, input_ids, output_ids, frames, tubelets,
-        positions=positions, stages=3, iters_per_stage=20
+        positions=positions, stages=3, iters_per_stage=20, index=ivd
     )
     # -- Calculating Union and Intersection Masks
     unique_tubes = np.unique(tubelets)
@@ -134,7 +134,7 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
 
     # -- Saving gifs for visualization
     if getattr(args, 'save_visuals', True):
-        eprint(f"{ivd+1}/{MAX_VIDEOS}: Visualizing the Masked Tubelets ({mode_name}).")
+        eprint(f"{ivd+1}/{args.num_videos}: Visualizing the Masked Tubelets ({mode_name}).")
         # Mask Visualization (using union mask as the default masking visual)
         keep_tubes_vis = [t for t in unique_tubes if t not in selected_union]
         visualize_spix(video_array, baseline_del, tubelets, keep_tubes_vis, os.path.join(args.output_dir, f"{ivd}_{file_prefix}mask_union.gif"))
@@ -164,8 +164,7 @@ def explain_vid(data, model, processor, args, tokenizer):
         with open(log_file, "a") as f:
             f.write(str(msg) + "\n")
 
-    num_videos = min(len(data), MAX_VIDEOS) if MAX_VIDEOS > 0 else len(data)
-    
+    num_videos = min(len(data), args.num_videos) if args.num_videos > 0 else len(data)
     global_metrics = {
         "auc_ins_union": [], "auc_del_union": [],
         "auc_ins_inter": [], "auc_del_inter": [],

@@ -2,8 +2,8 @@ import os
 import torch
 import torch.nn.functional as F
 import cv2
-import gc
 cv2.setNumThreads(0)
+import gc
 
 import time
 import sys
@@ -30,7 +30,6 @@ from qwen_vl_utils import process_vision_info
 import concurrent.futures
 
 DEFAULT_VIDEO_TOKEN = "<video>"
-NUM_FRAMES = 12
 
 def _run_slic_isolated(video_down_float, n_segments, compactness):
     """
@@ -111,7 +110,7 @@ def get_baseline_insertion(args, video_array):
 
 def get_baseline_deletion(args, video_array):
     """Returns the masking canvas used for Deletion metrics (White)."""
-    return np.full_like(video_array, 255)
+    return np.full_like(video_array, 255) # Constant white video
 
 def apply_universal_mask(foreground_array, background_array, tubelets, active_tubes):
     """
@@ -131,6 +130,7 @@ def apply_universal_mask(foreground_array, background_array, tubelets, active_tu
 
     
 def get_data(args, row):
+    num_frames = args.num_frames
     start_sec = 0
     end_sec = 1
     
@@ -149,7 +149,7 @@ def get_data(args, row):
         
         # Cap ImageNet resolution
         img.thumbnail((max_dim, max_dim))
-        video = [img for _ in range(NUM_FRAMES)]
+        video = [img for _ in range(num_frames)]
         
         eprint("================================")
         eprint(f"Question: {question_text}")
@@ -215,8 +215,7 @@ def get_data(args, row):
     else:
         start_idx = 0
         end_idx = total_frames - 1
-        
-    num_frames = NUM_FRAMES 
+
     video = []
     
     if total_frames > 0 and end_idx > start_idx:
@@ -239,199 +238,6 @@ def get_data(args, row):
     eprint("\n================================")
     
     return video, qs, cur_prompt, correct_idx
-
-# def get_data(args, row):
-#     start_sec = 0
-#     end_sec = 1
-#     # -- ImageNet Data Handling
-#     if getattr(args, 'dataset', '') == 'imagenet':
-#         question_text = "If you were a classifier trained on ImageNet, what object is in this video? Answer with only the class name."
-#         cur_prompt = question_text
-#         options_prompt = ""
-#         qs = cur_prompt
-#         correct_idx = row['label_name'].split(',')[0] 
-#         img = row['image'].convert('RGB')
-#         video = [img for _ in range(NUM_FRAMES)]
-#         eprint("================================")
-#         eprint(f"Question: {question_text}")
-#         eprint(f"Ground Truth: {correct_idx}")
-#         eprint("================================")
-#         return video, qs, cur_prompt, correct_idx
-#     # -- It was not ImageNet. TGIF / SIMPLE dataset.
-#     if getattr(args, 'dataset', '') == 'TGIF' or getattr(args, 'dataset', '') == 'simple':
-#         video_filename = f"{row['video_name']}.mp4" 
-#         if getattr(args, 'dataset', '') == 'TGIF':
-#             video_path = os.path.join(args.video_folder, "mp4", video_filename)
-#         else:
-#             video_path = os.path.join(args.video_folder, video_filename)
-#         question_text = row['question']
-#         cur_prompt = question_text
-#         options_prompt = "N/A (Open-ended)"
-#         qs = cur_prompt + "\nAnswer with as few words as possible."
-#         correct_idx = row['answer']
-#         apply_slice = False
-#     elif getattr(args, 'dataset', '') == 'k400':
-#         yt_id = row['youtube_id']
-#         # K400 filenames pad the start and end times to 6 digits (e.g., 417 -> 000417)
-#         start_time = str(row['time_start']).zfill(6)
-#         end_time = str(row['time_end']).zfill(6)
-#         video_filename = f"{yt_id}_{start_time}_{end_time}.mp4"
-#         # Assumes videos are in /data/k400/val/
-#         video_path = os.path.join(args.video_folder, "val", video_filename)
-#         question_text = "What type of activity is happening in this video? Answer with only the action class name."
-#         cur_prompt = question_text
-#         options_prompt = "N/A (Open-ended)"
-#         qs = cur_prompt
-#         correct_idx = row['label']
-#         apply_slice = False
-#     # -- HD-EPIC handling
-#     else:
-#         video_input = row['inputs']['video 1']
-#         video_id = video_input['id']
-#         participant_id = video_id.split('-')[0]
-#         video_filename = f"{video_id}.mp4" 
-#         video_path = os.path.join(args.video_folder, participant_id, video_filename)
-#         question_text = row['question']
-#         choices_list = row['choices']
-#         correct_idx = row['correct_idx']
-#         options_prompt = ""
-#         for i, option in enumerate(choices_list):
-#             option_str = ", ".join(option) if isinstance(option, list) else str(option)
-#             options_prompt += f"\n{i}. {option_str}"
-#         cur_prompt = f"{question_text}{options_prompt}"
-#         qs = cur_prompt + "\nAnswer with only the INDEX of the correct answer."
-#         apply_slice = args.apply_slice
-#         if apply_slice:
-#             start_sec = timestamp_to_sec(video_input['start_time'])
-#             end_sec = timestamp_to_sec(video_input['end_time'])
-
-#     vr = VideoReader(video_path, ctx=cpu(0))
-#     fps = vr.get_avg_fps()
-#     total_frames = len(vr)
-#     if apply_slice:
-#         start_idx = int(round(start_sec * fps))
-#         end_idx = int(round(end_sec * fps))
-#         end_idx = min(end_idx, total_frames)
-#     else:
-#         start_idx = 0
-#         end_idx = total_frames - 1
-#     num_frames = NUM_FRAMES 
-#     video = []
-#     if total_frames > 0 and end_idx > start_idx:
-#         indices = np.linspace(start_idx, end_idx - 1, num_frames).astype(int)
-#         batch_data = vr.get_batch(indices).asnumpy()
-#         video = [Image.fromarray(frame) for frame in batch_data]
-#     if getattr(args, 'random_shuffle', False):
-#         random.shuffle(video)
-#     eprint("================================\n")
-#     eprint(f"Question: {question_text}")
-#     eprint(f"Options: {options_prompt}")
-#     eprint(f"Ground Truth: {correct_idx}")
-#     eprint("\n================================")
-#     return video, qs, cur_prompt, correct_idx
-
-# -- Tubelet generation
-
-def generate_tubelets(video, args):
-    video_array = np.stack([np.array(img) for img in video]) 
-    T, H, W, C = video_array.shape
-    if getattr(args, 'use_slic', True):
-        tubelet_labels = slic(
-            video_array, n_segments=300, compactness=10, channel_axis=-1, spacing=[2, 1, 1]
-        )
-    else:
-        grid_size = 8
-        y_indices = np.clip((np.arange(H) / (H / grid_size)).astype(int), 0, grid_size - 1)
-        x_indices = np.clip((np.arange(W) / (W / grid_size)).astype(int), 0, grid_size - 1)
-        grid_y, grid_x = np.meshgrid(y_indices, x_indices, indexing='ij')
-        frame_labels = grid_y * grid_size + grid_x
-        tubelet_labels = np.tile(frame_labels, (T, 1, 1))
-    return video_array, tubelet_labels
-
-def generate_tubelets_optimized(video, args, downsample_factor=0.5):
-    video_array = np.stack([np.array(img) for img in video]) 
-    T, H, W, C = video_array.shape
-    
-    if getattr(args, 'use_slic', True):
-        # 1. CPU Downsampling via OpenCV
-        if downsample_factor < 1.0:
-            down_H, down_W = int(H * downsample_factor), int(W * downsample_factor)
-            video_down = np.stack([
-                cv2.resize(frame, (down_W, down_H), interpolation=cv2.INTER_LINEAR) 
-                for frame in video_array
-            ])
-        else:
-            video_down = video_array.copy()
-
-        # Cast to float32 [0, 1] to keep the memory footprint tiny
-        video_down_float = (video_down.astype(np.float32) / 255.0)
-
-        # We perform SLIC clustering in an isolated process (otherwise this would lead into deadlocks)
-        n_seg = getattr(args, 'n_segments', 120)
-        comp = getattr(args, 'compactness', 10)
-        with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
-            # Submit the job to the isolated process
-            future = executor.submit(_run_slic_isolated, video_down_float, n_seg, comp)
-            # This will wait for the child process to return the result
-            tubelet_labels_down = future.result() 
-        
-        # 3. CPU Upsampling via OpenCV
-        if downsample_factor < 1.0:
-            labels_uint16 = tubelet_labels_down.astype(np.uint16)
-            tubelet_labels = np.stack([
-                cv2.resize(label_frame, (W, H), interpolation=cv2.INTER_NEAREST) 
-                for label_frame in labels_uint16
-            ]).astype(int)
-        else:
-            tubelet_labels = tubelet_labels_down
-
-    else:
-        grid_size = 8
-        y_indices = np.clip((np.arange(H) / (H / grid_size)).astype(int), 0, grid_size - 1)
-        x_indices = np.clip((np.arange(W) / (W / grid_size)).astype(int), 0, grid_size - 1)
-        grid_y, grid_x = np.meshgrid(y_indices, x_indices, indexing='ij')
-        frame_labels = grid_y * grid_size + grid_x
-        tubelet_labels = np.tile(frame_labels, (T, 1, 1))
-        
-    return video_array, tubelet_labels
-
-# def generate_tubelets_optimized(video, args, downsample_factor=0.5):
-#     video_array = np.stack([np.array(img) for img in video]) 
-#     T, H, W, C = video_array.shape
-#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-#     if getattr(args, 'use_slic', True):
-#         # Downsampling: move to GPU, reshape to [Batch, Channels, Depth(T), Height, Width]
-#         video_tensor = torch.from_numpy(video_array).permute(3, 0, 1, 2).unsqueeze(0).float().to(device)
-#         down_H, down_W = int(H * downsample_factor), int(W * downsample_factor)
-#         video_down = F.interpolate(video_tensor, size=(T, down_H, down_W), mode='trilinear', align_corners=False)
-#         # And then retrieve back to CPU for skimage
-#         video_for_slic = video_down.squeeze(0).permute(1, 2, 3, 0).cpu().numpy().astype(video_array.dtype)
-#         # SLIC: fast because the volume is tiny and connectivity is off
-#         tubelet_labels_down = slic(
-#             video_for_slic, 
-#             n_segments=120,              # Note: Within SWAG-V, it was found 120 is optimal for video
-#             compactness=10, 
-#             channel_axis=-1, 
-#             spacing=[2, 1, 1],
-#             max_num_iter=4,              # Relaxed convergence
-#             enforce_connectivity=False   # Bypasses the slowest CPU step
-#         )
-#         # Upsampling on GPU: push labels back to GPU - [Batch, Channels, Depth, Height, Width]
-#         labels_tensor = torch.from_numpy(tubelet_labels_down).unsqueeze(0).unsqueeze(0).float().to(device)
-#         # We use 'nearest' so we don't blend integer class IDs (e.g., tubelet 1 and 3 don't become tubelet 2)
-#         labels_up = F.interpolate(labels_tensor, size=(T, H, W), mode='nearest')
-#         tubelet_labels = labels_up.squeeze().cpu().numpy().astype(int)
-#     else:
-#         # Fallback grid logic
-#         grid_size = 8
-#         y_indices = np.clip((np.arange(H) / (H / grid_size)).astype(int), 0, grid_size - 1)
-#         x_indices = np.clip((np.arange(W) / (W / grid_size)).astype(int), 0, grid_size - 1)
-#         grid_y, grid_x = np.meshgrid(y_indices, x_indices, indexing='ij')
-#         frame_labels = grid_y * grid_size + grid_x
-#         tubelet_labels = np.tile(frame_labels, (T, 1, 1))
-#     return video_array, tubelet_labels
-
 
 # -- VLM utils
 
@@ -548,6 +354,53 @@ def create_description(args, model, processor, frames, tokenizer):
         inputs = processor(text=prompt, videos=frames, return_tensors='pt')
         _, _, description = generate(args, model, tokenizer, inputs)
     return description
+    
+def generate_tubelets_optimized(video, args, downsample_factor=0.5):
+    video_array = np.stack([np.array(img) for img in video]) 
+    T, H, W, C = video_array.shape
+    
+    if getattr(args, 'use_slic', True):
+        # 1. CPU Downsampling via OpenCV
+        if downsample_factor < 1.0:
+            down_H, down_W = int(H * downsample_factor), int(W * downsample_factor)
+            video_down = np.stack([
+                cv2.resize(frame, (down_W, down_H), interpolation=cv2.INTER_LINEAR) 
+                for frame in video_array
+            ])
+        else:
+            video_down = video_array.copy()
+
+        # Cast to float32 [0, 1] to keep the memory footprint tiny
+        video_down_float = (video_down.astype(np.float32) / 255.0)
+
+        # We perform SLIC clustering in an isolated process (otherwise this would lead into deadlocks)
+        n_seg = getattr(args, 'n_segments', 120)
+        comp = getattr(args, 'compactness', 10)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
+            # Submit the job to the isolated process
+            future = executor.submit(_run_slic_isolated, video_down_float, n_seg, comp)
+            # This will wait for the child process to return the result
+            tubelet_labels_down = future.result() 
+        
+        # 3. CPU Upsampling via OpenCV
+        if downsample_factor < 1.0:
+            labels_uint16 = tubelet_labels_down.astype(np.uint16)
+            tubelet_labels = np.stack([
+                cv2.resize(label_frame, (W, H), interpolation=cv2.INTER_NEAREST) 
+                for label_frame in labels_uint16
+            ]).astype(int)
+        else:
+            tubelet_labels = tubelet_labels_down
+
+    else:
+        grid_size = 8
+        y_indices = np.clip((np.arange(H) / (H / grid_size)).astype(int), 0, grid_size - 1)
+        x_indices = np.clip((np.arange(W) / (W / grid_size)).astype(int), 0, grid_size - 1)
+        grid_y, grid_x = np.meshgrid(y_indices, x_indices, indexing='ij')
+        frame_labels = grid_y * grid_size + grid_x
+        tubelet_labels = np.tile(frame_labels, (T, 1, 1))
+        
+    return video_array, tubelet_labels
 
 # -- Visualization methods
 
@@ -623,6 +476,25 @@ def visualize_tubelets(video_array, tubelet_labels, output_path):
     )
     print(f"Saved visualization to {output_path}")
 
+
+def visualize_interaction_matrix(interaction_matrix, output_path):
+    plt.figure(figsize=(10, 8))
+    max_val = np.max(np.abs(interaction_matrix))
+    if max_val == 0:
+        max_val = 1.0 
+    sns.heatmap(
+        interaction_matrix, cmap="RdYlGn", center=0, vmin=-max_val, vmax=max_val,
+        annot=True, fmt=".3f", linewidths=.5,
+        cbar_kws={'label': 'Interaction Index (Red=Redundant (lim -2), Green=Synergistic (lim 2))'}
+    )
+    plt.title("Frame Pairwise Interactions (Shapley)")
+    plt.xlabel("Frame Index J")
+    plt.ylabel("Frame Index I")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+
+
 def visualize_heatmap(video_array, tubelet_labels, tubelet_scores, output_path, alpha=0.7, blur_fraction=0.15, gamma=1.0):
     visualized_video = []
     max_id = tubelet_labels.max()
@@ -652,7 +524,7 @@ def visualize_heatmap(video_array, tubelet_labels, tubelet_scores, output_path, 
         blurred_mask = cv2.GaussianBlur(mask_frame, (k_size, k_size), 0)
         # Convert to 0-255 for the colormap
         heatmap_uint8 = np.uint8(255 * blurred_mask)
-        heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+        heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET )
         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB).astype(np.float32)
         # We scale the alpha by the blurred mask itself.
         # Where the mask is 0, dynamic_alpha is 0 (100% original image).
@@ -667,23 +539,95 @@ def visualize_heatmap(video_array, tubelet_labels, tubelet_scores, output_path, 
     )
     print(f"Saved heatmap visualization to {output_path}")
 
-def visualize_interaction_matrix(interaction_matrix, output_path):
-    plt.figure(figsize=(10, 8))
-    max_val = np.max(np.abs(interaction_matrix))
-    if max_val == 0:
-        max_val = 1.0 
-    sns.heatmap(
-        interaction_matrix, cmap="RdYlGn", center=0, vmin=-max_val, vmax=max_val,
-        annot=True, fmt=".3f", linewidths=.5,
-        cbar_kws={'label': 'Interaction Index (Red=Redundant (lim -2), Green=Synergistic (lim 2))'}
-    )
-    plt.title("Frame Pairwise Interactions (Shapley)")
-    plt.xlabel("Frame Index J")
-    plt.ylabel("Frame Index I")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300)
-    plt.close()
+def visualize_gradients(gradients, frames, tubelets, save_folder, step, title="IG_Step", alpha=0.6, blur_fraction=0.08):
+    """
+    Overlays tubelet gradients onto original frames using cv2/PIL for fast GIF generation.
+    Blue = Negative (suppresses output), Red = Positive (supports output).
+    Unimportant areas (zero gradient) remain the original grayscale frame.
+    """
+    #-- Map 1D tubelet gradients back to the 3D video space (T, H, W)
+    if torch.is_tensor(gradients):
+        gradients = gradients.detach().cpu().numpy()
+    if torch.is_tensor(tubelets):
+        tubelets = tubelets.detach().cpu().numpy()
+        
+    spatial_grads = gradients[tubelets].astype(np.float32)
+    T, H, W = spatial_grads.shape
+    
+    #-- Determine symmetric limits for the diverging colormap
+    vmax = np.max(np.abs(spatial_grads))
+    if vmax == 0: vmax = 1e-9 # Prevent division by zero
+    
+    #-- Dynamic blur kernel size based on frame resolution
+    k_size = int(min(H, W) * blur_fraction)
+    k_size = k_size + 1 if k_size % 2 == 0 else k_size 
+    k_size = max(5, k_size) 
 
+    visualized_video = []
+    cmap = plt.get_cmap('coolwarm') # Still the easiest way to get Blue-White-Red
+
+    for t in range(T):
+        #-- Extract and format the base image
+        image = frames[t]
+        if torch.is_tensor(image):
+            image = image.detach().cpu().numpy()
+            if image.ndim == 3 and image.shape[0] == 3: # If channels first (C, H, W)
+                image = np.transpose(image, (1, 2, 0))
+        else:
+            # ---> FIX: Convert PIL Image (or other types) to NumPy array <---
+            image = np.array(image)
+                
+        # Ensure image is in 0-255 float range for blending
+        if image.max() <= 1.0:
+            image = image * 255.0
+        image = image.astype(np.float32)
+        
+        #-- Convert base image to 3-channel grayscale so the Red/Blue heatmap pops
+        # Check if grayscale already (shape (H, W)) to prevent index errors
+        if image.ndim == 2:
+            image = image[..., np.newaxis]
+            
+        gray_image = np.mean(image, axis=-1, keepdims=True)
+        gray_image = np.repeat(gray_image, 3, axis=-1)
+        
+        #-- Process the gradient mask
+        grad_frame = spatial_grads[t]
+        
+        # Blur the raw gradients to smooth the blocky tubelets
+        blurred_grad = cv2.GaussianBlur(grad_frame, (k_size, k_size), 0)
+        
+        # Calculate absolute magnitude for the alpha mask (0.0 to 1.0)
+        magnitude = np.abs(blurred_grad) / vmax
+        magnitude = np.clip(magnitude, 0, 1)
+        
+        # Normalize gradients to [0, 1] for the colormap (-vmax -> 0.0, 0 -> 0.5, +vmax -> 1.0)
+        norm_grad = (blurred_grad / vmax + 1.0) / 2.0
+        norm_grad = np.clip(norm_grad, 0, 1)
+        
+        # Apply colormap to get RGB overlay (drop the alpha channel from cmap)
+        heatmap_rgba = cmap(norm_grad)
+        heatmap_rgb = (heatmap_rgba[..., :3] * 255.0).astype(np.float32)
+        
+        #-- Perform dynamic alpha blending
+        # Where magnitude is 0, alpha is 0 (100% original frame)
+        # Where magnitude is 1, alpha is `alpha` (e.g., 60% heatmap, 40% frame)
+        dynamic_alpha = magnitude[..., np.newaxis] * alpha
+        overlay = (1.0 - dynamic_alpha) * gray_image + dynamic_alpha * heatmap_rgb
+        
+        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+        visualized_video.append(Image.fromarray(overlay))
+
+    # --- SAVE AS GIF ---
+    os.makedirs(save_folder, exist_ok=True)
+    save_path = os.path.join(save_folder, f"{title}_step_{step:03d}.gif")
+    
+    visualized_video[0].save(
+        save_path, 
+        save_all=True, 
+        append_images=visualized_video[1:], 
+        duration=250, # 4 FPS 
+        loop=0
+    )
 
 # -- Keyword finder (based on 'Where do VLMs look at')
 

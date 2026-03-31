@@ -14,6 +14,8 @@ def init_args():
     parser.add_argument('--ig_steps', type=int, default=5)
     parser.add_argument('--stages', type=int, default=4)
     parser.add_argument('--iterations', type=int, default=15)
+    parser.add_argument('--num_frames', type=int, default=12)
+    parser.add_argument('--num_videos', type=int, default=5)
 
     parser.add_argument(
         '--model',
