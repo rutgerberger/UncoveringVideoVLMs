@@ -1,5 +1,6 @@
 from utils import *
 from method_helpers import *
+from method_helpers import _get_rescale_and_dummys, _rescale_mask
 
 from PIL import Image
 import numpy as np
@@ -8,17 +9,204 @@ import torch
 import heapq
 import random
 import itertools
+import gc
 
+from cmaes import CMA_ES, SimulatedAnnealing_optimization
+from surrogate_es import SAEA_CMA_ES
 
-def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None, stages=3, iters_per_stage=20, index=1):
+def spix_rise_perturbation(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None, num_masks=50, p=0.5):
     """
-    Optimize two separate masks. 'Whack-a-Mole Optimization'
-        - We run gradient descent in multiple stages (with args.iterations per stage)
-        - Each stage, highest scoring tublets are masked (or revealed for insertion)
-        - We force the optimizer to find secondary and tertiary evidence in subsequent stages
+    Randomized Input Sampling for Explanation (RISE).
+    Generates `num_masks` random binary masks, evaluates the raw model logit, 
+    and assigns importance based on the expected marginal contribution of each tubelet.
+    """
+    eprint(f"\n--- Starting RISE Perturbation ({num_masks} Masks) ---")
+    
+    video_array = np.stack([np.array(img) for img in frames])
+    full_ids = torch.cat((input_ids, output_ids), dim=1)
+    is_qwen = getattr(args, 'model', '') == 'qwen'
+    target_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    
+    # -- Generate Baseline (background video when masked)
+    baseline_ins = get_baseline_insertion(args, video_array) 
+    baseline_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
+    num_tubes = int(tubelets.max()) + 1
+    tubelets_tensor = torch.tensor(tubelets, device=model.device, dtype=torch.long)
+
+    # -- Fast Tensor Setup
+    packed_inputs = _get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, tubelets)
+    (dummy_inputs_orig, pixels_orig, pixels_base,
+     target_T, target_H, target_W, t_dim_index,
+     crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig) = packed_inputs
+
+    # -- Tracking arrays
+    sum_score_vis = np.zeros(num_tubes, dtype=np.float32)
+    count_vis = np.zeros(num_tubes, dtype=np.float32)
+    sum_score_hid = np.zeros(num_tubes, dtype=np.float32)
+    count_hid = np.zeros(num_tubes, dtype=np.float32)
+
+    forward_kwargs = {
+        "input_ids": full_ids,
+        "attention_mask": torch.ones_like(full_ids).to(model.device), 
+        "use_cache": False
+    }
+    if is_qwen:
+        forward_kwargs["video_grid_thw"] = dummy_inputs_orig["video_grid_thw"]
+
+    # -- Main Loop --
+    for k in range(1, num_masks + 1):
+        # Generate Random Binary Mask
+        # W_step is 1 (visible) with probability p, and 0 (hidden) with probability 1-p
+        W_step = torch.bernoulli(torch.full((num_tubes,), p, device=model.device))
+        W_step_np = W_step.cpu().numpy()
+        # Upscale and Format Mask to match Video Tensor
+        M_high_res_step = W_step[tubelets_tensor].unsqueeze(1).float() 
+        M_low_res_step = _rescale_mask(
+            M_high_res_step, new_H, new_W, crop_top, crop_left, 
+            target_H, target_W, target_T, T_orig, is_qwen, t_dim_index
+        )
+        # Blend Tensors (on GPU)
+        pixels_final = pixels_orig * M_low_res_step + pixels_base * (1.0 - M_low_res_step)
+        forward_kwargs["pixel_values_videos"] = pixels_final.to(dtype=model.dtype)
+
+        # Forward Pass (No Gradients Required ==> Faster =)) )
+        with torch.no_grad():
+            outputs = model(**forward_kwargs)
+            logits = outputs.logits
+            
+            #extract raw logits (no softmax, prevent saturation)
+            out_len = output_ids.shape[-1]
+            target_logits = logits[:, -out_len - 1 : -1, :]
+            target_logits_gathered = target_logits.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+            if positions is not None and len(positions) > 0:
+                target_logits_gathered = target_logits_gathered[0, positions]
+            
+            #raw un-squashed confidence score of the current random mask
+            score = target_logits_gathered.mean().item()
+
+        #accumulate scores
+        sum_score_vis += W_step_np * score
+        count_vis += W_step_np
+        sum_score_hid += (1.0 - W_step_np) * score
+        count_hid += (1.0 - W_step_np)
+
+        if k % 10 == 0:
+            eprint(f">> RISE Iteration {k}/{num_masks} | Current Mask Mean Logit: {score:.4f}")
+
+    # -- Scoring Calculation --
+    # Expected logit when tubelet is visible
+    E_vis = sum_score_vis / np.maximum(count_vis, 1.0)
+    # Expected logit when tubelet is hidden
+    E_hid = sum_score_hid / np.maximum(count_hid, 1.0)
+    
+    # The true importance of a tubelet is how much it increases the logit when visible
+    # compared to when it is hidden. (Zero-centered automatically!)
+    importance = E_vis - E_hid
+
+    # -- Format for Framework --
+    #We only care about tubelets that positively contribute to the target text
+    scores_dict = {t: float(importance[t]) for t in range(num_tubes)}
+    scores_ins = {t: max(0.0, s) for t, s in scores_dict.items()}
+    scores_del = scores_ins.copy() # they are both equal, haha
+    max_score = max(scores_ins.values())
+    
+    #Thresholding: Keep tubelets that provide at least 20% of the max observed contribution
+    if max_score > 1e-4: 
+        dynamic_threshold = max_score * 0.20 
+        selected_tubelets = [t for t, s in scores_ins.items() if s >= dynamic_threshold]
+    else:
+        selected_tubelets = []
+
+    if len(selected_tubelets) == 0:
+        eprint(f"Warning: Variance was dead. Falling back to top 5%.")
+        ranked_all = sorted(scores_ins.keys(), key=lambda k: scores_ins[k], reverse=True)
+        selected_tubelets = ranked_all[:max(1, int(num_tubes * 0.05))]
+    # Cleanup
+    del pixels_orig, pixels_base, dummy_inputs_orig
+    torch.cuda.empty_cache()
+    gc.collect()
+    return selected_tubelets, selected_tubelets, scores_ins, scores_del
+
+def spix_cmaes(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins, baseline_del, positions=None):
+    """
+    Goal: perform CMA-ES / Optimize Weights / Return weights (no merging yet)
+    """
+    full_ids = torch.cat((input_ids, output_ids), dim=1)
+    
+    # We pass the PIL images of the baselines to CMA_ES
+    frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
+    frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
+    frames_orig = [Image.fromarray(np.array(img).astype(np.uint8)) for img in frames]
+
+    eprint("--- Starting CMA-ES Optimization (Deletion) ---")
+    _, scores_del, deletion_metrics = CMA_ES(
+            args, model, processor, tokenizer, full_ids, output_ids, 
+            frames_orig, frames_del_base, tubelets, positions=positions, mode='deletion'
+    )
+    
+    eprint("--- Starting CMA-ES Optimization (Insertion) ---")
+    _, scores_ins, insertion_metrics = CMA_ES(
+            args, model, processor, tokenizer, full_ids, output_ids, 
+            frames_orig, frames_ins_base, tubelets, positions=positions, mode='insertion'
+    )
+
+    if getattr(args, 'normalize_weights', False):
+        eprint("Normalizing weights...")
+        # Min-max normalization per dictionary
+        max_ins = max(scores_ins.values()) or 1.0
+        max_del = max(scores_del.values()) or 1.0
+        scores_ins = {t: s / max_ins for t, s in scores_ins.items()}
+        scores_del = {t: s / max_del for t, s in scores_del.items()}
+
+    # Rank tubelets based on scores (Descending)
+    selected_ins = sorted(scores_ins.keys(), key=lambda t: scores_ins[t], reverse=True)
+    selected_del = sorted(scores_del.keys(), key=lambda t: scores_del[t], reverse=True)
+
+    return selected_ins, selected_del, scores_ins, scores_del, insertion_metrics, deletion_metrics
+
+def spix_simulated_annealing(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None):
+    """
+    Optimizes deletion and insertion masks using a single-pass Simulated Annealing global search.
     """
     video_array = np.stack([np.array(img) for img in frames])
     full_ids = torch.cat((input_ids, output_ids), dim=1)
+    is_qwen = getattr(args, 'model', '') == 'qwen'
+    
+    # -- Generate Base Canvases
+    baseline_ins = get_baseline_insertion(args, video_array) 
+    baseline_del = get_baseline_deletion(args, video_array)  
+    
+    frames_orig = [Image.fromarray(f.astype(np.uint8)) for f in video_array]
+    frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
+    frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
+
+    # --- 1. Deletion Optimization ---
+    eprint("\n--- Starting SA Deletion Optimization ---")
+    selected_del, scores_del, deletion_metrics = SimulatedAnnealing_optimization(
+        args, model, processor, tokenizer, full_ids, output_ids, 
+        frames_orig, frames_del_base, tubelets, positions=positions, mode='deletion'
+    )
+
+    # --- 2. Insertion Optimization ---
+    eprint("\n--- Starting SA Insertion Optimization ---")
+    selected_ins, scores_ins, insertion_metrics = SimulatedAnnealing_optimization(
+        args, model, processor, tokenizer, full_ids, output_ids, 
+        frames_orig, frames_ins_base, tubelets, positions=positions, mode='insertion'
+    )
+
+    return selected_ins, selected_del, scores_ins, scores_del, insertion_metrics, deletion_metrics
+
+def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None, max_stages=2, discount_factor=0.75, index=1):
+    """
+    Optimize two separate masks. 'Whack-a-Mole Optimization'
+        - We run a while loop until the model's confidence is destroyed or max_stages is hit.
+        - Saliency scores are normalized per stage and decayed over time.
+    """
+    video_array = np.stack([np.array(img) for img in frames])
+    full_ids = torch.cat((input_ids, output_ids), dim=1)
+    is_qwen = getattr(args, 'model', '') == 'qwen'
+    
+    target_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     
     # -- Generate Base Canvases
     baseline_ins = get_baseline_insertion(args, video_array) 
@@ -29,64 +217,201 @@ def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output
     accumulated_del = set()
     final_scores_ins = {}
     final_scores_del = {}
+    deletion_metrics = {}
+    insertion_metrics = {}
 
-    # -- Insetion Optimization
-    eprint(f"\n--- Starting Iterative Insertion Optimization ({args.stages} Stages) ---")
-    current_baseline_ins = baseline_ins.copy()
-    for stage in range(1, args.stages + 1):
-        eprint(f"\n>> [Insertion Stage {stage}/{args.stages}]")
-        #Update baseline (shows previously found tubelets)
-        frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in current_baseline_ins]
-        
-        # -- Main Weight Optimization Loop
-        selected, scores = optimize_tubelet_weights(
-            args, model, tokenizer, processor, full_ids, output_ids, frames, frames_ins_base, 
-            tubelets, positions, mode='insertion', stage=f"{index}-{stage}-insertion") 
-
-        # -- Evaluation. Record highest score a tubelet achieved across all stages
-        for t, s in scores.items():
-            final_scores_ins[t] = max(final_scores_ins.get(t, 0), s)
-        # -- Filtering & Recording Inside Set
-        new_selected = [t for t in selected if t not in accumulated_ins]
-        if not new_selected:
-            eprint("No new tubelets found. Stopping insertion stages early.")
-            break
-        accumulated_ins.update(new_selected)
-
-        # -- Update Basline: Reveal newly selected tubelets
-        mask = np.isin(tubelets, list(accumulated_ins))[..., np.newaxis]
-        current_baseline_ins = np.where(mask, video_array, baseline_ins)
+    # -- Get the "True" Original Confidence once to base thresholds on
+    frames_orig = [Image.fromarray(f.astype(np.uint8)) for f in video_array]
+    _, initial_orig_conf, initial_orig_ent = evaluate_confidence(model, processor, frames_orig, input_ids, output_ids, is_qwen)
+    # Dynamic thresholds based on the unmasked video's confidence
+    min_confidence_del = 0.8 * initial_orig_conf # Stop deletion when confidence drops to 80% of original (AND entr).
+    max_confidence_ins = 0.8 * initial_orig_conf # Stop insertion when we recover 80% of original confidence
+    target_entropy = 1.50 * initial_orig_ent # Entropy increases by 50%
 
 
-    # -- Deletion Optimization
-    eprint(f"\n--- Starting Iterative Deletion Optimization ({args.stages} Stages) ---")
+    eprint(f"\n--- Starting Iterative Deletion Optimization ---")
     current_video_del = video_array.copy()
-    for stage in range(1, args.stages + 1):
-        eprint(f"\n>> [Deletion Stage {stage}/{args.stages}]")
-        #Update baseline (hides previously found tubelets)
+    stage = 1
+    
+    while stage <= max_stages:
+        eprint(f"\n>> [Deletion Stage {stage}/{max_stages}]")
         frames_current_video = [Image.fromarray(f.astype(np.uint8)) for f in current_video_del]
         frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
 
-        # -- Main Weight Optimization Loop
-        selected, scores = optimize_tubelet_weights(
-            args, model, tokenizer, processor, full_ids, output_ids, frames_current_video, frames_del_base, 
-            tubelets, positions, mode='deletion', stage=f"{index}-{stage}-deletion")
+        # Check current model confidence before optimizing
+        pred_ids, current_conf, current_ent = evaluate_confidence(model, processor, frames_current_video, input_ids, output_ids, is_qwen)
+        pred_text = tokenizer.decode(pred_ids[0], skip_special_tokens=True)
+        eprint(f"Current State -> Prediction: '{pred_text}' | Entropy {current_ent:.4f} | Confidence in '{target_text}': {current_conf:.4f}")
+        
+        if current_conf <= min_confidence_del and current_ent >= target_entropy:
+            eprint(f"Target destroyed! Conf ({current_conf:.4f} <= {min_confidence_del:.4f}) AND Ent ({current_ent:.4f} >= {target_entropy:.4f}). Stopping Deletion.")
+            break
 
-        # -- Evaluation. Record highest score a tubelet achieved across all stages
-        for t, s in scores.items():
-            final_scores_del[t] = max(final_scores_del.get(t, 0), s)
-        # -- Filtering & Recording Inside Set
-        new_selected = [t for t in selected if t not in accumulated_del]
-        if not new_selected:
+        # Main Weight Optimization Loop
+        # selected, scores, metrics = optimize_tubelet_weights(
+        #     args, model, tokenizer, processor, full_ids, output_ids, frames_current_video, frames_del_base, 
+        #     tubelets, positions, mode='deletion', stage=f"{index}-{stage}-deletion")
+        selected, scores, metrics = SimulatedAnnealing_optimization(
+            args, model, processor, tokenizer, full_ids, output_ids, 
+            frames_current_video, frames_del_base, tubelets, positions=None, mode='deletion'
+        )
+
+        eprint(f"Selected tubelets {selected}")
+        if not selected:
             eprint("No new tubelets found. Stopping deletion stages early.")
             break
+
+        deletion_metrics[f"stage_{stage}"] = metrics
+        
+        # Normalize and Decay
+        stage_max = max(scores.values()) if scores else 1.0
+        stage_min = min(scores.values()) if scores else 0.0
+        current_discount = discount_factor ** (stage - 1)
+        for t, s in scores.items():
+            #normalized_s = (s - stage_min) / (stage_max - stage_min + 1e-7)
+            decayed_s = s * current_discount
+            final_scores_del[t] = max(final_scores_del.get(t, 0), decayed_s) # Gradients above 0
+
+        # Filtering & Recording
+        new_selected = [t for t in selected if t not in accumulated_del]
         accumulated_del.update(new_selected)
 
-        # -- Update the target video: mask the newly selected tubelets
+        # Update the target video: completely mask the newly selected tubelets with the baseline
         mask = np.isin(tubelets, list(accumulated_del))[..., np.newaxis]
         current_video_del = np.where(mask, baseline_del, video_array)
+        stage += 1
 
-    return list(accumulated_ins), list(accumulated_del), final_scores_ins, final_scores_del
+    eprint(f"\n--- Starting Iterative Insertion Optimization ---")
+    current_baseline_ins = baseline_ins.copy()
+    stage = 1
+
+    while stage <= max_stages:
+        eprint(f"\n>> [Insertion Stage {stage}/{max_stages}]")
+        # For insertion, the "baseline" we pass to the model gets progressively more original pixels revealed
+        frames_current_ins = [Image.fromarray(f.astype(np.uint8)) for f in current_baseline_ins]
+        
+        # Check current model confidence before optimizing
+        pred_ids, current_conf, current_ent = evaluate_confidence(model, processor, frames_current_ins, input_ids, output_ids, is_qwen)
+        pred_text = tokenizer.decode(pred_ids[0], skip_special_tokens=True)
+        eprint(f"Current State -> Prediction: '{pred_text}' | Entropy {current_ent:.4f} | Confidence in '{target_text}': {current_conf:.4f}")
+        
+        if current_conf > max_confidence_ins and stage > 1:
+            eprint(f"Confidence recovered above threshold ({max_confidence_ins:.4f}). Stopping Insertion.")
+            break
+
+        # Main Weight Optimization Loop
+        # Note: frames_orig is constant (the target), frames_current_ins acts as the blurred/constant baseline
+        # selected, scores, metrics = optimize_tubelet_weights(
+        #     args, model, tokenizer, processor, full_ids, output_ids, frames_orig, frames_current_ins, 
+        #     tubelets, positions, mode='insertion', stage=f"{index}-{stage}-insertion")
+        selected, scores, metrics = SimulatedAnnealing_optimization(
+            args, model, processor, tokenizer, full_ids, output_ids, 
+            frames_orig, frames_current_ins, tubelets, positions=None, mode='insertion'
+        )
+
+        if not selected:
+            eprint("No new tubelets found. Stopping insertion stages early.")
+            break
+
+        insertion_metrics[f"stage_{stage}"] = metrics
+        # Normalize and Decay (for saliency scores)
+        stage_max = max(scores.values()) if scores else 1.0
+        stage_min = min(scores.values()) if scores else 0.0
+        current_discount = discount_factor ** (stage - 1)
+        for t, s in scores.items():
+            normalized_s = (s - stage_min) / (stage_max - stage_min + 1e-7)
+            decayed_s = normalized_s * current_discount
+            final_scores_ins[t] = max(final_scores_ins.get(t, 0), decayed_s)
+
+        # Filtering & Recording
+        new_selected = [t for t in selected if t not in accumulated_ins]
+        accumulated_ins.update(new_selected)
+
+        # Update the target video: completely reveal the newly selected tubelets by replacing baseline with original
+        mask = np.isin(tubelets, list(accumulated_ins))[..., np.newaxis]
+        current_baseline_ins = np.where(mask, video_array, baseline_ins)
+        
+        stage += 1
+
+    return list(accumulated_ins), list(accumulated_del), final_scores_ins, final_scores_del, insertion_metrics, deletion_metrics 
+
+# def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None, stages=3, iters_per_stage=20, index=1):
+#     """
+#     Optimize two separate masks. 'Whack-a-Mole Optimization'
+#         - We run gradient descent in multiple stages (with args.iterations per stage)
+#         - Each stage, highest scoring tublets are masked (or revealed for insertion)
+#         - We force the optimizer to find secondary and tertiary evidence in subsequent stages
+#     """
+#     video_array = np.stack([np.array(img) for img in frames])
+#     full_ids = torch.cat((input_ids, output_ids), dim=1)
+    
+#     # -- Generate Base Canvases
+#     baseline_ins = get_baseline_insertion(args, video_array) 
+#     baseline_del = get_baseline_deletion(args, video_array)  
+
+#     # -- State Tracking
+#     accumulated_ins = set()
+#     accumulated_del = set()
+#     final_scores_ins = {}
+#     final_scores_del = {}
+
+#     # -- Insetion Optimization
+#     eprint(f"\n--- Starting Iterative Insertion Optimization ({args.stages} Stages) ---")
+#     current_baseline_ins = baseline_ins.copy()
+#     for stage in range(1, args.stages + 1):
+#         eprint(f"\n>> [Insertion Stage {stage}/{args.stages}]")
+#         #Update baseline (shows previously found tubelets)
+#         frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in current_baseline_ins]
+        
+#         # -- Main Weight Optimization Loop
+#         selected, scores = optimize_tubelet_weights(
+#             args, model, tokenizer, processor, full_ids, output_ids, frames, frames_ins_base, 
+#             tubelets, positions, mode='insertion', stage=f"{index}-{stage}-insertion") 
+
+#         # -- Evaluation. Record highest score a tubelet achieved across all stages
+#         for t, s in scores.items():
+#             final_scores_ins[t] = max(final_scores_ins.get(t, 0), s)
+#         # -- Filtering & Recording Inside Set
+#         new_selected = [t for t in selected if t not in accumulated_ins]
+#         if not new_selected:
+#             eprint("No new tubelets found. Stopping insertion stages early.")
+#             break
+#         accumulated_ins.update(new_selected)
+
+#         # -- Update Basline: Reveal newly selected tubelets
+#         mask = np.isin(tubelets, list(accumulated_ins))[..., np.newaxis]
+#         current_baseline_ins = np.where(mask, video_array, baseline_ins)
+
+
+#     # -- Deletion Optimization
+#     eprint(f"\n--- Starting Iterative Deletion Optimization ({args.stages} Stages) ---")
+#     current_video_del = video_array.copy()
+#     for stage in range(1, args.stages + 1):
+#         eprint(f"\n>> [Deletion Stage {stage}/{args.stages}]")
+#         #Update baseline (hides previously found tubelets)
+#         frames_current_video = [Image.fromarray(f.astype(np.uint8)) for f in current_video_del]
+#         frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
+
+#         # -- Main Weight Optimization Loop
+#         selected, scores = optimize_tubelet_weights(
+#             args, model, tokenizer, processor, full_ids, output_ids, frames_current_video, frames_del_base, 
+#             tubelets, positions, mode='deletion', stage=f"{index}-{stage}-deletion")
+
+#         # -- Evaluation. Record highest score a tubelet achieved across all stages
+#         for t, s in scores.items():
+#             final_scores_del[t] = max(final_scores_del.get(t, 0), s)
+#         # -- Filtering & Recording Inside Set
+#         new_selected = [t for t in selected if t not in accumulated_del]
+#         if not new_selected:
+#             eprint("No new tubelets found. Stopping deletion stages early.")
+#             break
+#         accumulated_del.update(new_selected)
+
+#         # -- Update the target video: mask the newly selected tubelets
+#         mask = np.isin(tubelets, list(accumulated_del))[..., np.newaxis]
+#         current_video_del = np.where(mask, baseline_del, video_array)
+
+#     return list(accumulated_ins), list(accumulated_del), final_scores_ins, final_scores_del
 
 
 

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import cv2
 cv2.setNumThreads(0)
 import gc
+import re
 
 import time
 import sys
@@ -24,12 +25,90 @@ from PIL import Image
 from textwrap import fill
 import torch.utils.checkpoint as checkpoint
 from io import BytesIO
+from itertools import combinations
 
 from qwen_vl_utils import process_vision_info
 
 import concurrent.futures
 
 DEFAULT_VIDEO_TOKEN = "<video>"
+
+def calculate_and_visualize_synergy(args, model, processor, full_ids, output_ids, frames, video_array, tubelets, top_tubelets, positions=None, output_path="synergy_matrix.png"):
+    """
+    Calculates the pairwise interaction (synergy) between the top K identified tubelets.
+    """
+    eprint(f"\n--- Starting Synergy Matrix Calculation ({len(top_tubelets)} tubelets) ---")
+    baseline_del = get_baseline_deletion(args, video_array)
+    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
+    
+    # Dictionaries to store confidence drops
+    drop_individual = {}
+    drop_pairwise = {}
+    
+    for t_id in top_tubelets:
+        # Mask only this specific tubelet
+        frames_masked = apply_universal_mask(video_array, baseline_del, tubelets, [t_id])
+        p_masked = get_prob(args, model, processor, full_ids, output_ids, frames_masked, positions)
+        drop_individual[t_id] = prob_orig - p_masked
+    pairs = list(combinations(top_tubelets, 2))
+    for i, (t1, t2) in enumerate(pairs):
+        if i % 10 == 0:
+            eprint(f"Computing pair {i}/{len(pairs)}...")
+            
+        frames_masked = apply_universal_mask(video_array, baseline_del, tubelets, [t1, t2])
+        p_masked = get_prob(args, model, processor, full_ids, output_ids, frames_masked, positions)
+        drop_pairwise[(t1, t2)] = prob_orig - p_masked
+    K = len(top_tubelets)
+    synergy_matrix = np.zeros((K, K))
+    
+    for idx1, t1 in enumerate(top_tubelets):
+        for idx2, t2 in enumerate(top_tubelets):
+            if idx1 == idx2:
+                # Diagonal is the individual drop (optional, set to 0 for pure synergy)
+                synergy_matrix[idx1, idx2] = 0.0 
+            else:
+                # Retrieve the pair regardless of order
+                pair = (t1, t2) if (t1, t2) in drop_pairwise else (t2, t1)
+                D_joint = drop_pairwise[pair]
+                D_ind1 = drop_individual[t1]
+                D_ind2 = drop_individual[t2]
+                # Synergy = Joint Drop - (Sum of Individual Drops)
+                S = D_joint - (D_ind1 + D_ind2)
+                synergy_matrix[idx1, idx2] = S
+    plt.figure(figsize=(10, 8))
+    
+    # Force the colormap to be symmetric around 0
+    max_val = np.max(np.abs(synergy_matrix))
+    if max_val == 0: max_val = 1e-5
+    
+    # Labels for axes
+    labels = [f"Tube {t}" for t in top_tubelets]
+    
+    sns.heatmap(
+        synergy_matrix, 
+        cmap="coolwarm",      # Blue = Redundant (<0), Red = Synergistic (>0)
+        center=0, 
+        vmin=-max_val, 
+        vmax=max_val,
+        xticklabels=labels, 
+        yticklabels=labels,
+        annot=True,           # Show the exact numbers
+        fmt=".3f", 
+        linewidths=.5,
+        cbar_kws={'label': 'Synergy Index (Red = Synergistic, Blue = Redundant)'}
+    )
+    
+    plt.title(f"Attention Entanglement (Synergy Matrix)\nBase Prob: {prob_orig:.3f}")
+    plt.xlabel("Tubelet ID")
+    plt.ylabel("Tubelet ID")
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    
+    eprint(f"Synergy matrix saved to {output_path}")
+    return synergy_matrix
 
 def _run_slic_isolated(video_down_float, n_segments, compactness):
     """
@@ -171,7 +250,55 @@ def get_data(args, row):
         qs = cur_prompt + "\nAnswer with as few words as possible."
         correct_idx = row['answer']
         apply_slice = False
+    elif getattr(args, 'dataset', '') == 'clevrer':
+        video_filename = row.get('video_filename', '')
+        video_path = None
+        match = re.search(r'\d+', video_filename)
+        if match:
+            vid_num = int(match.group())
+            lower_bound = (vid_num // 1000) * 1000
+            upper_bound = lower_bound + 1000
+            subfolder_name = f"video_{lower_bound}-{upper_bound}"
+            fast_path = os.path.join(args.video_folder, subfolder_name, video_filename)
+            if os.path.exists(fast_path):
+                video_path = fast_path
+
+        # Fallback to os.walk ONLY if the mathematical path fails or file is missing
+        if video_path is None:
+            for root, dirs, files in os.walk(args.video_folder):
+                if video_filename in files:
+                    video_path = os.path.join(root, video_filename)
+                    break
+                    
+        # Absolute fallback if neither worked
+        if video_path is None:
+            video_path = os.path.join(args.video_folder, video_filename)
+
+        # Parse question data
+        q_data = row['questions'][0] # first question in the scene
+        question_text = q_data['question']
+        q_type = q_data.get('question_type', 'descriptive')
+        options_prompt = ""
         
+        # Descriptive questions have a direct string answer
+        if q_type == 'descriptive' or 'choices' not in q_data:
+            correct_idx = q_data.get('answer', '')
+            cur_prompt = question_text
+            qs = cur_prompt + "\nAnswer with as few words as possible."
+        else:
+            correct_choices = []
+            for i, choice in enumerate(q_data['choices']):
+                options_prompt += f"\n{i}. {choice['choice']}"
+                if choice.get('answer') == 'correct':
+                    correct_choices.append(str(i))
+            # CLEVRER multiple-choice questions can have multiple correct answers.
+            # We join them by comma (e.g., "0, 2")
+            correct_idx = ", ".join(correct_choices)
+            cur_prompt = f"{question_text}{options_prompt}"
+            qs = cur_prompt + "\nAnswer with only the INDEX of the correct answer(s)."
+            
+        apply_slice = False
+
     elif getattr(args, 'dataset', '') == 'k400':
         yt_id = row['youtube_id']
         start_time = str(row['time_start']).zfill(6)
@@ -222,8 +349,6 @@ def get_data(args, row):
     if total_frames > 0 and end_idx > start_idx:
         indices = np.linspace(start_idx, end_idx - 1, num_frames).astype(int)
         batch_data = vr.get_batch(indices).asnumpy()
-        
-        # --- ROOT CAUSE FIX: Cap Video Frame Resolution ---
         for frame in batch_data:
             img = Image.fromarray(frame)
             img.thumbnail((max_dim, max_dim))
@@ -687,39 +812,26 @@ def find_keywords(args, model, processor, input_ids, output_ids, frames, baselin
             
     return positions, keywords
 
+def merge_masks_borda(selected_ins, selected_del, unique_tubes):
+    """
+    Merges insertion and deletion ranked lists using Borda Count.
+    Tubelets are given points based on their rank (1st place gets N points, last gets 1).
+    """
+    N = len(unique_tubes)
+    borda_scores = {t: 0 for t in unique_tubes}
+    
+    # Assign points based on reverse rank (0th index gets N points)
+    for rank, t in enumerate(selected_ins):
+        borda_scores[t] += (N - rank)
+        
+    for rank, t in enumerate(selected_del):
+        borda_scores[t] += (N - rank)
+        
+    # Sort tubelets based on their combined Borda score
+    selected_merged = sorted(unique_tubes, key=lambda t: borda_scores[t], reverse=True)
+    return selected_merged, borda_scores
 
 # -- AUC Curves
-def _compute_pixel_ranks(T, H, W, tubelets, selected_tubes, seed):
-    """AUC helper, computes pixel importance and adds smooth noise for AUC generation."""
-    pixel_ranks = np.zeros((T, H, W), dtype=np.float32)
-    num_selected = len(selected_tubes)
-    
-    for i, t_id in enumerate(selected_tubes):
-        pixel_ranks[tubelets == t_id] = num_selected - i
-    
-    np.random.seed(seed)
-    tubelet_noise = np.random.rand(int(tubelets.max()) + 1) * 0.5  
-    pixel_ranks += tubelet_noise[tubelets]
-    sorted_ranks = np.sort(pixel_ranks, axis=None)[::-1]
-    
-    return pixel_ranks, sorted_ranks
-
-def _fast_tensor_forward(model, forward_kwargs, blended_pixels, output_ids, positions):
-    """AUC helper, runs optimized forward pass on the GPU."""
-    with torch.no_grad():
-        outputs = model(**forward_kwargs, pixel_values_videos=blended_pixels)
-        logits = outputs.logits[:, -output_ids.shape[-1] - 1 : -1, :]
-        probs = F.softmax(logits, dim=-1).gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-        
-        if probs.dim() == 0:
-            probs = probs.unsqueeze(0)
-        if positions is not None and len(positions) > 0:
-            probs = probs[0, positions]
-            
-        prob_val = probs.mean().item()
-        
-        del outputs, logits # Aggressive cache clearing
-        return prob_val
 
 def _plot_and_save_auc(percentages, ins_curve, del_curve, auc_ins, auc_del, prob_orig, prob_blur, output_dir, ivd):
     """Handles matplotlib generation and disk I/O."""
@@ -739,115 +851,66 @@ def _plot_and_save_auc(percentages, ins_curve, del_curve, auc_ins, auc_del, prob
     plt.savefig(os.path.join(output_dir, f"{ivd}_auc_curves.png"))
     plt.close()
 
-def evaluate_auc(args, model, processor, full_ids, output_ids, frames, tubelets, selected_tubes, ivd=0, positions=None, num_steps=20):
-    eprint("\n--- Starting AUC Evaluation (Pixel-wise) ---")
-    video_array = np.stack([np.array(img) for img in frames])
+def evaluate_auc(args, model, processor, full_ids, output_ids, frames, video_array, tubelets, selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=0, positions=None, num_steps=20):
+    eprint("\n--- Starting Clean AUC Evaluation ---")
     T, H, W, _ = video_array.shape
-    num_pixels = T * H * W
     
-    # Get baselines & calculate starting bounds
-    baseline_ins = get_baseline_insertion(args, video_array)
-    baseline_del = get_baseline_deletion(args, video_array)
-    frames_blur = [Image.fromarray(f) for f in baseline_ins]
-    frames_del_base = [Image.fromarray(f) for f in baseline_del]
+    baseline_ins_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins_arr]
+    baseline_del_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del_arr]
     
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
-    prob_blur = get_prob(args, model, processor, full_ids, output_ids, frames_blur, positions)
+    prob_blur = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions)
+    prob_del_base = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions)
     
-    # Compute pixel ranks and initialize curves
-    pixel_ranks, sorted_ranks = _compute_pixel_ranks(T, H, W, tubelets, selected_tubes, args.manual_seed)
-    ins_curve, del_curve, percentages = [prob_blur], [prob_orig], [0.0]
+    # Rank the pixels (Higher value = More Important)
+    pixel_ranks = np.zeros((T, H, W), dtype=np.float32)
+    num_selected = len(selected_tubes)
     
-    # Pre-process Tensors to GPU
-    is_qwen = getattr(args, 'model', '') == 'qwen'
+    for i, t_id in enumerate(selected_tubes):
+        pixel_ranks[tubelets == t_id] = num_selected - i
+        
+    # Add tiny uniform noise to strictly break ties across non-selected background pixels
+    np.random.seed(getattr(args, 'manual_seed', 42))
+    pixel_ranks += np.random.rand(*pixel_ranks.shape) * 0.5 
     
-    if is_qwen:
-        orig_inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896)
-        blur_inputs = processor(text=[" "], videos=[frames_blur], padding=True, return_tensors="pt", max_pixels=112896)
-        del_inputs = processor(text=[" "], videos=[frames_del_base], padding=True, return_tensors="pt", max_pixels=112896)
-    else:
-        orig_inputs = processor(text=" ", videos=frames, return_tensors="pt")
-        blur_inputs = processor(text=" ", videos=frames_blur, return_tensors="pt")
-        del_inputs = processor(text=" ", videos=frames_del_base, return_tensors="pt")
-        
-    pixels_orig = orig_inputs['pixel_values_videos'].to(model.device, dtype=model.dtype).detach()
-    pixels_blur = blur_inputs['pixel_values_videos'].to(model.device, dtype=model.dtype).detach()
-    pixels_del_base = del_inputs['pixel_values_videos'].to(model.device, dtype=model.dtype).detach()
+    # Main Evaluation Loop
+    fractions = np.linspace(0.0, 1.0, num_steps + 1)
+    ins_curve_raw, del_curve_raw = [], []
     
-    # --- MODEL AGNOSTIC SHAPE EXTRACTION ---
-    target_shape = pixels_orig.shape
-    if is_qwen:
-        # Extract temporal and spatial grid from Qwen's metadata
-        grid_thw = orig_inputs['video_grid_thw'][0]
-        target_T, target_H, target_W = grid_thw[0].item(), grid_thw[1].item(), grid_thw[2].item()
-    else:
-        # Fallback to standard Video-LLaVA 5D extraction
-        if pixels_orig.dim() == 4:
-            pixels_orig = pixels_orig.unsqueeze(0)
-            pixels_blur = pixels_blur.unsqueeze(0)
-            pixels_del_base = pixels_del_base.unsqueeze(0)
-            target_shape = pixels_orig.shape
-            
-        t_dim_index, target_H, target_W = (2, target_shape[3], target_shape[4]) if target_shape[1] == 3 else (1, target_shape[3], target_shape[4])
+    for f in fractions:
+        # Find the threshold that isolates the top `f` fraction of pixels
+        # If f=0 -> thresh = max (mask is entirely False)
+        # If f=1 -> thresh = min (mask is entirely True)
+        thresh = np.percentile(pixel_ranks, 100.0 * (1.0 - f))
+        mask = pixel_ranks >= thresh
+        mask_expanded = mask[..., np.newaxis]
         
-    forward_kwargs = {"input_ids": full_ids, "attention_mask": torch.ones_like(full_ids).to(model.device), "use_cache": True}
-    if 'video_grid_thw' in orig_inputs:
-        forward_kwargs['video_grid_thw'] = orig_inputs['video_grid_thw'].to(model.device)
-        
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    # Evaluation Loop (Optimized)
-    for step in range(1, num_steps + 1):
-        now = time.time()
-        eprint(f"step {step}/{num_steps}")
-        fraction = step / num_steps
-        
-        idx = max(0, min(int(fraction * num_pixels) - 1, num_pixels - 1))
-        current_mask = pixel_ranks >= sorted_ranks[idx]
-        
-        # --- MODEL AGNOSTIC MASK INTERPOLATION ---
-        mask_tensor = torch.tensor(current_mask, dtype=torch.float32, device=model.device) # Shape: (T, H, W)
-        
-        if is_qwen:
-            # Format as 5D volume for trilinear interpolation: (1, 1, T, H, W)
-            mask_vol = mask_tensor.unsqueeze(0).unsqueeze(0)
-            mask_low_res_vol = F.interpolate(mask_vol, size=(target_T, target_H, target_W), mode='nearest')
-            # Flatten to 1D sequence to broadcast against Qwen's patch sequence
-            mask_low_res = mask_low_res_vol.view(-1, 1)
-        else:
-            # Format as (T, 1, H, W) for standard spatial interpolation
-            mask_spatial = mask_tensor.unsqueeze(1)
-            mask_low_res_base = F.interpolate(mask_spatial, size=(target_H, target_W), mode='nearest')
-            mask_low_res = mask_low_res_base.unsqueeze(0) if t_dim_index == 1 else mask_low_res_base.permute(1, 0, 2, 3).unsqueeze(0)
+        # -- Deletion --
+        # f=0: Original video. f=1: Baseline masked video.
+        del_array = np.where(mask_expanded, baseline_del_arr, video_array).astype(np.uint8)
+        frames_del = [Image.fromarray(frm) for frm in del_array]
+        p_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
+        del_curve_raw.append(p_del)
 
-        # GPU Blending
-        pixels_ins = pixels_orig * mask_low_res + pixels_blur * (1.0 - mask_low_res)
-        pixels_del = pixels_del_base * mask_low_res + pixels_orig * (1.0 - mask_low_res)
-        
-        # GPU Inference
-        ins_curve.append(_fast_tensor_forward(model, forward_kwargs, pixels_ins, output_ids, positions))
-        del_curve.append(_fast_tensor_forward(model, forward_kwargs, pixels_del, output_ids, positions))
-        percentages.append(fraction)
-        eprint(f"Done in {time.time() - now:.2f}s")
+        # -- Insertion --
+        # f=0: Baseline blurred video. f=1: Original video.
+        ins_array = np.where(mask_expanded, video_array, baseline_ins_arr).astype(np.uint8)
+        frames_ins = [Image.fromarray(frm) for frm in ins_array]
+        p_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
+        ins_curve_raw.append(p_ins)
 
-        # Cleanup
-        del mask_tensor, mask_low_res
-        del pixels_ins, pixels_del
-        if is_qwen:
-            del mask_vol, mask_low_res_vol
-        else:
-            del mask_spatial, mask_low_res_base
+    # Standard XAI Metric Normalization (Clamped to prevent > 1.0 anomalies)
+    norm_ins = np.clip((np.array(ins_curve_raw) - prob_blur) / (prob_orig - prob_blur + 1e-7), 0, 1)
+    norm_del = np.clip((np.array(del_curve_raw) - prob_del_base) / (prob_orig - prob_del_base + 1e-7), 0, 1)
 
-    # Final Metrics & Plotting
-    auc_ins, auc_del = auc(percentages, ins_curve), auc(percentages, del_curve)
-    eprint(f"Final Pixel AUC - Insertion: {auc_ins:.4f} | Deletion: {auc_del:.4f}")
-    _plot_and_save_auc(percentages, ins_curve, del_curve, auc_ins, auc_del, prob_orig, prob_blur, args.output_dir, ivd)
+    auc_ins = auc(fractions, norm_ins)
+    auc_del = auc(fractions, norm_del)
+
+    eprint(f"Final AUC - Insertion: {auc_ins:.4f} | Deletion: {auc_del:.4f}")
+
+    # Plot raw probabilities for readability
+    _plot_and_save_auc(list(fractions), ins_curve_raw, del_curve_raw, auc_ins, auc_del, prob_orig, prob_blur, args.output_dir, ivd)
     
-    del pixels_orig, pixels_blur, pixels_del_base
-    del orig_inputs, blur_inputs, del_inputs
-    torch.cuda.empty_cache()
-
     return auc_ins, auc_del
 
 # -- For iGOS++
@@ -896,13 +959,13 @@ def evaluate_auc_pixel(args, model, processor, full_ids, output_ids, frames, con
     baseline_ins = get_baseline_insertion(args, video_array)
     baseline_del = get_baseline_deletion(args, video_array)
     
-    og_scores = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
+    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
     frames_blur = [Image.fromarray(f) for f in baseline_ins]
-    blur_scores = get_prob(args, model, processor, full_ids, output_ids, frames_blur, positions)
+    prob_blur = get_prob(args, model, processor, full_ids, output_ids, frames_blur, positions)
     
-    # Curves track raw probabilities for the unnormalized AUC
-    del_curve = [og_scores]
-    ins_curve = [blur_scores]
+    # Curves track raw probabilities for the plotting function
+    del_curve = [prob_orig]
+    ins_curve = [prob_blur]
     index = [0.0]
     
     # Broadcast and sort pixels
@@ -935,13 +998,27 @@ def evaluate_auc_pixel(args, model, processor, full_ids, output_ids, frames, con
         
         index.append((pixels + current_step_size) / num_pixels)
 
-    # Compute Unnormalized AUC using sklearn (matching your first function perfectly)
-    auc_del = auc(index, del_curve)
-    auc_ins = auc(index, ins_curve)
+    # --- NEW: Normalize curves before AUC calculation (Matching evaluate_auc) ---
+    norm_ins_curve = [(p - prob_blur) / (prob_orig - prob_blur + 1e-7) for p in ins_curve]
+    norm_del_curve = [(p - prob_blur) / (prob_orig - prob_blur + 1e-7) for p in del_curve]
 
-    eprint(f"Final unnormalized AUC - Insertion: {auc_ins:.4f} | Deletion: {auc_del:.4f}")
+    # Compute Normalized AUC using sklearn
+    auc_del = auc(index, norm_del_curve)
+    auc_ins = auc(index, norm_ins_curve)
+
+    eprint(f"Final Normalized AUC - Insertion: {auc_ins:.4f} | Deletion: {auc_del:.4f}")
     
-    # Generate the visual curves
-    save_curves(del_curve, ins_curve, index, auc_del, auc_ins, ivd, args.output_dir)
+    # Generate the visual curves using the unified plotting function
+    _plot_and_save_auc(
+        percentages=index, 
+        ins_curve=ins_curve, 
+        del_curve=del_curve, 
+        auc_ins=auc_ins, 
+        auc_del=auc_del, 
+        prob_orig=prob_orig, 
+        prob_blur=prob_blur, 
+        output_dir=args.output_dir, 
+        ivd=ivd
+    )
     
     return auc_ins, auc_del

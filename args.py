@@ -16,6 +16,8 @@ def init_args():
     parser.add_argument('--iterations', type=int, default=15)
     parser.add_argument('--num_frames', type=int, default=12)
     parser.add_argument('--num_videos', type=int, default=5)
+    parser.add_argument('--popsize', type=int, default=20)
+    parser.add_argument('--normalize_weights', type=lambda x: (str(x).lower() == 'true'), default=True)
 
     parser.add_argument(
         '--model',
@@ -166,7 +168,6 @@ def init_args():
     parser.add_argument(
         '--method',
         type=str,
-        choices=['spix', 'igos'],
         default='spix',
         help='Which explanation method to run.'
     )
