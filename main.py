@@ -98,29 +98,34 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     )
 
     #Unite the masks (both intersection and union)
-    raw_union = set(selected_ins) | set(selected_del)
-    raw_inter = set(selected_ins) & set(selected_del)
-    selected_union, _ = merge_masks_borda(selected_ins, selected_del, list(raw_union))
-    selected_inter, _ = merge_masks_borda(selected_ins, selected_del, list(raw_inter))
+    # raw_union = set(selected_ins) | set(selected_del)
+    # raw_inter = set(selected_ins) & set(selected_del)
+    # selected_union, _ = merge_masks_borda(selected_ins, selected_del, list(raw_union))
+    # selected_inter, _ = merge_masks_borda(selected_ins, selected_del, list(raw_inter))
+    scores_merged = {}
+    for t in unique_tubes:
+        # Multiply the continuous scores (Logical AND / Intersection)
+        scores_merged[t] = scores_ins.get(t, 0.0) * scores_del.get(t, 0.0)
+    selected_merged = sorted(list(unique_tubes), key=lambda t: scores_merged[t], reverse=True)
 
     k_fraction = 0.20
     k_tubes = max(1, int(len(unique_tubes) * k_fraction))
 
-    top_ins = selected_ins[:k_tubes]
-    frames_ins = apply_universal_mask(video_array, baseline_ins_arr, tubelets, top_ins)
+    top_final = selected_merged[:k_tubes]
+    frames_ins = apply_universal_mask(video_array, baseline_ins_arr, tubelets, top_final)
     prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
     
-    top_del = selected_del[:k_tubes]
-    keep_tubes_del = [t for t in unique_tubes if t not in top_del]
+    keep_tubes_del = [t for t in unique_tubes if t not in top_final]
     frames_del = apply_universal_mask(video_array, baseline_del_arr, tubelets, keep_tubes_del)
     prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
 
     top_k = min(5, len(selected_ins))
     fmt_ins = {t: f"{scores_ins.get(t, 0):.4f}" for t in selected_ins[:top_k]}
     fmt_del = {t: f"{scores_del.get(t, 0):.4f}" for t in selected_del[:top_k]}
+    fmt_merged = {t: f"{scores_merged.get(t, 0):.4f}" for t in selected_merged[:top_k]}
 
     log_func("-" * 25)
-    log_func(f"Question: {question_text}")
+    log_func(f"Question {ivd+1}/{args.num_videos}: {question_text}")
     log_func(f"Ground Truth: {ground_truth}")
     log_func(f"Model Answer: {model_answer}")
     log_func(f"Extracted Keywords: {keywords} (Positions: {positions})")
@@ -133,21 +138,16 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     log_func(f"Created tubelets in {(time.time() - start):.2f}s")
     log_func(f"Final Insertion tubelets (Top {top_k}): {fmt_ins} ({len(selected_ins)}/{len(unique_tubes)})")
     log_func(f"Final Deletion tubelets (Top {top_k}): {fmt_del} ({len(selected_del)}/{len(unique_tubes)})")
-    log_func(f"Prob with Insertion Mask (top 20%): {prob_ins:.5f} (Diff: {prob_orig - prob_ins:.5f})")
-    log_func(f"Prob with Deletion Mask (top 20%): {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
+    log_func(f"Final Combined tubelets (Top {top_k}): {fmt_merged} ({len(selected_merged)}/{len(unique_tubes)})")
+    log_func(f"Prob when Inserting Mask (top 20%): {prob_ins:.5f} (Diff: {prob_orig - prob_ins:.5f})")
+    log_func(f"Prob when Deleting Mask (top 20%): {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
 
-    auc_ins_union, auc_del_union = evaluate_auc(
+    auc_ins, auc_del = evaluate_auc(
         args, model, processor, full_ids, output_ids, frames, video_array, tubelets, 
-        selected_union, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_union", positions=positions
+        selected_merged, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_merged", positions=positions
     )
     
-    auc_ins_inter, auc_del_inter = evaluate_auc(
-        args, model, processor, full_ids, output_ids, frames, video_array, tubelets, 
-        selected_inter, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_inter", positions=positions
-    )
-    
-    log_func(f"\nAUC Union - Ins: {auc_ins_union:.4f} | Del: {auc_del_union:.4f}")
-    log_func(f"AUC Inter - Ins: {auc_ins_inter:.4f} | Del: {auc_del_inter:.4f}\n")
+    log_func(f"\nAUC Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     metrics_file = os.path.join(args.output_dir, "frame_experiment_metrics.jsonl")
@@ -156,25 +156,22 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
         "num_frames": args.num_frames,
         "deletion_metrics": deletion_metrics,
         "insertion_metrics": insertion_metrics,
-        "AUC Union - Ins": auc_ins_union, "AUC Union - Del": auc_del_union,
-        "AUC Inter - Ins": auc_ins_inter, "AUC Inter - Del": auc_del_inter
+        "AUC Ins": auc_ins, "AUC Del": auc_del,
     }
     with open(metrics_file, "a") as f:
         f.write(json.dumps(experiment_data) + "\n")
 
     if getattr(args, 'save_visuals', True):
         eprint(f"{ivd+1}/{args.num_videos}: Visualizing the Masked Tubelets ({mode_name}).")
-        scores_union = {t: max(scores_ins.get(t, 0), scores_del.get(t, 0)) for t in raw_union}
-        scores_inter = {t: min(scores_ins.get(t, 0), scores_del.get(t, 0)) for t in raw_inter}
-        
-        keep_tubes_vis = [t for t in unique_tubes if t not in selected_union]
-        visualize_spix(video_array, baseline_del_arr, tubelets, keep_tubes_vis, os.path.join(args.output_dir, f"{ivd}_{file_prefix}mask_union.gif"))
+        # Binary cutout of top 20%
+        keep_tubes_vis = [t for t in unique_tubes if t not in top_final]
+        visualize_spix(video_array, baseline_del_arr, tubelets, keep_tubes_vis, os.path.join(args.output_dir, f"{ivd}_{file_prefix}mask_cutout.gif"))
+        # Continuous heatmaps
         visualize_heatmap(video_array, tubelets, scores_ins, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_ins.gif"))
         visualize_heatmap(video_array, tubelets, scores_del, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_del.gif"))
-        visualize_heatmap(video_array, tubelets, scores_union, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_union.gif"))
-        visualize_heatmap(video_array, tubelets, scores_inter, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_inter.gif"))
+        visualize_heatmap(video_array, tubelets, scores_merged, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_merged.gif"))
         
-    return auc_ins_union, auc_del_union, auc_ins_inter, auc_del_inter
+    return auc_ins, auc_del
 
 def explain_vid(data, model, processor, args, tokenizer):
     now = datetime.datetime.now()
@@ -192,10 +189,9 @@ def explain_vid(data, model, processor, args, tokenizer):
             f.write(str(msg) + "\n")
 
     num_videos = min(len(data), args.num_videos) if args.num_videos > 0 else len(data)
-    global_metrics = {k: [] for k in ["auc_ins_union", "auc_del_union", "auc_ins_inter", "auc_del_inter",
-                                      "gt_auc_ins_union", "gt_auc_del_union", "gt_auc_ins_inter", "gt_auc_del_inter"]}
+    global_metrics = {k: [] for k in ["auc_ins", "auc_del", "gt_auc_ins", "gt_auc_del"]}
     
-    for ivd in range(num_videos):
+    for ivd in range(1,num_videos):
         eprint(f"\n{ivd+1}/{num_videos}: Retrieving data.")
         start = time.time()
         idx = random.randint(0, len(data)-1) if args.dataset == 'k400' else ivd
@@ -231,10 +227,8 @@ def explain_vid(data, model, processor, args, tokenizer):
             mode_name="STANDARD", file_prefix=""
         )
 
-        global_metrics["auc_ins_union"].append(metrics[0])
-        global_metrics["auc_del_union"].append(metrics[1])
-        global_metrics["auc_ins_inter"].append(metrics[2])
-        global_metrics["auc_del_inter"].append(metrics[3])
+        global_metrics["auc_ins"].append(metrics[0])
+        global_metrics["auc_del"].append(metrics[1])
 
         if getattr(args, 'gt_forcing', False):    
             gt_ids = tokenizer(ground_truth_label, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)
@@ -245,10 +239,8 @@ def explain_vid(data, model, processor, args, tokenizer):
                     input_ids, gt_ids, qs, ground_truth_label, output_text, ground_truth_label, ivd, log, 
                     mode_name="GROUND TRUTH", file_prefix="gt_"
                 )
-                global_metrics["gt_auc_ins_union"].append(res_gt[0])
-                global_metrics["gt_auc_del_union"].append(res_gt[1])
-                global_metrics["gt_auc_ins_inter"].append(res_gt[2])
-                global_metrics["gt_auc_del_inter"].append(res_gt[3])
+                global_metrics["gt_auc_ins"].append(res_gt[0])
+                global_metrics["gt_auc_del"].append(res_gt[1])
 
         gc.collect()
         torch.cuda.empty_cache()
