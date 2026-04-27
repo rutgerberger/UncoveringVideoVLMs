@@ -2,88 +2,9 @@ import cma
 import torch
 import numpy as np
 import torch.nn.functional as F
+
 from utils import *
-
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
-
-
-def rescale_mask(mask, new_H, new_W, crop_top, crop_left, target_H, target_W, target_T, T_orig, is_qwen, t_dim_index):
-    """
-    Resizes mask to input size of the VLM and returns both the formatted 
-    VLM tensor and the 5D volumetric tensor for TV norm calculation.
-    """
-    M_resized_step = F.interpolate(mask, size=(new_H, new_W), mode='bilinear', align_corners=False)
-    M_cropped_step = M_resized_step[:, :, crop_top:crop_top+target_H, crop_left:crop_left+target_W]
-    M_vol_step = M_cropped_step.permute(1, 0, 2, 3).unsqueeze(0) # (1, 1, T, H, W)
-    
-    if target_T != T_orig:
-        M_vol_step = F.interpolate(M_vol_step, size=(target_T, target_H, target_W), mode='trilinear', align_corners=False)
-    
-    if is_qwen:
-        M_scaled = M_vol_step.view(-1, 1) 
-    else:
-        if t_dim_index == 1:
-            M_scaled = M_vol_step.permute(0, 2, 1, 3, 4) # (1, T, 1, H, W)
-        else:
-            M_scaled = M_vol_step # (1, 1, T, H, W)
-
-    return M_scaled, M_vol_step
-
-
-def tv_norm_3d(mask, tv_beta=2):
-    """
-    Calculates the Total Variation loss for a 3D video mask.
-    mask shape expected: (Batch, Channels, Time, Height, Width)
-    Includes shape guards to prevent NaN when Time, Height, or Width == 1
-    """
-    tv_t = torch.mean(torch.abs(mask[:, :, 1:, :, :] - mask[:, :, :-1, :, :]).pow(tv_beta)) if mask.shape[2] > 1 else 0.0
-    tv_h = torch.mean(torch.abs(mask[:, :, :, 1:, :] - mask[:, :, :, :-1, :]).pow(tv_beta)) if mask.shape[3] > 1 else 0.0
-    tv_w = torch.mean(torch.abs(mask[:, :, :, :, 1:] - mask[:, :, :, :, :-1]).pow(tv_beta)) if mask.shape[4] > 1 else 0.0
-    
-    return tv_t + tv_h + tv_w
-
-
-def _get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, tubelets):
-    """
-    Given a huggingface VLM, its corresponding processor,
-    a list of frames, and a list of baseline frames, this
-    function returns dummy inputs and geometric scaling parameters.
-    """
-    with torch.no_grad():
-        if is_qwen:
-            dummy_inputs_orig = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896).to(model.device)
-            dummy_inputs_base = processor(text=[" "], videos=[baseline_frames], padding=True, return_tensors="pt", max_pixels=112896).to(model.device)
-            pixels_orig = dummy_inputs_orig['pixel_values_videos'].detach()
-            pixels_base = dummy_inputs_base['pixel_values_videos'].detach()
-            
-            grid_thw = dummy_inputs_orig['video_grid_thw'][0] 
-            target_T, target_H, target_W = grid_thw[0].item(), grid_thw[1].item(), grid_thw[2].item()
-            # Qwen's tensor is strictly 2D: (total_patches, patch_features)
-            target_C = pixels_orig.shape[1] 
-            t_dim_index = -1 # Placeholder, standard 5D indexing does not apply
-        else:
-            dummy_inputs_orig = processor(text=" ", videos=frames, return_tensors="pt").to(model.device)
-            dummy_inputs_base = processor(text=" ", videos=baseline_frames, return_tensors="pt").to(model.device)
-            pixels_orig = dummy_inputs_orig['pixel_values_videos'].detach()
-            pixels_base = dummy_inputs_base['pixel_values_videos'].detach()
-            
-            target_tensor_shape = pixels_orig.shape
-            if target_tensor_shape[1] == 3: 
-                target_C, target_T, target_H, target_W = target_tensor_shape[1:5]
-                t_dim_index = 2
-            else:
-                target_T, target_C, target_H, target_W = target_tensor_shape[1:5]
-                t_dim_index = 1
-                
-    # Cropping: Precalculate exact HF geometry scaling
-    T_orig, H_orig, W_orig = tubelets.shape
-    ratio = max(target_H / float(H_orig), target_W / float(W_orig))
-    new_H, new_W = int(H_orig * ratio), int(W_orig * ratio)
-    crop_top = (new_H - target_H) // 2
-    crop_left = (new_W - target_W) // 2
-    
-    return dummy_inputs_orig, pixels_orig, pixels_base, target_T, target_H, target_W, t_dim_index, crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig
+from method_helpers import *
 
 
 def evaluate_fitness(
@@ -150,6 +71,11 @@ def CMA_ES(
     frames_orig, frames_base, tubelets, positions=None, mode='deletion',
     max_iters=None, initial_weights=None, active_tubes=None, popsize=None
     ):
+    """
+    Performs main optimization using CMA-ES optimizers
+    - Finds ~ optimal weights according to objective (min/max confidence)
+    - Returns metrics and found weights
+    """
     num_tubes = int(tubelets.max()) + 1
     tubelets_tensor = torch.tensor(tubelets, device=model.device, dtype=torch.long)
     is_qwen = getattr(args, 'model', '') == 'qwen'
@@ -231,7 +157,7 @@ def CMA_ES(
         scores = {t: float(W_final[t]) for t in range(num_tubes)}
 
     max_score = max(scores.values()) if scores else 0.0
-    threshold = max_score * 0.10 if max_score > 0.01 else 0.0
+    threshold = max_score * 0.10 if max_score > 0.01 else 0.0 # Needs to be doing something at least
     selected_tubelets = [t for t, s in scores.items() if s >= threshold]
 
     # es.D contains the square roots of the eigenvalues of the covariance matrix
@@ -258,136 +184,4 @@ def CMA_ES(
         "num_top_candidates": len(top_masks)
     }
     
-    return selected_tubelets, scores, metrics
-    
-
-def SimulatedAnnealing_optimization(
-    args, model, processor, tokenizer, full_ids, output_ids, 
-    frames_orig, frames_base, tubelets, positions=None, mode='deletion'
-):
-    """
-    Optimizes a binary mask using Simulated Annealing, tuned for a strict 
-    budget of 250 VLM evaluations.
-    """
-    num_tubes = int(tubelets.max()) + 1
-    tubelets_tensor = torch.tensor(tubelets, device=model.device, dtype=torch.long)
-    is_qwen = getattr(args, 'model', '') == 'qwen'
-    
-    packed_inputs = _get_rescale_and_dummys(
-        model, processor, frames_orig, frames_base, is_qwen, tubelets
-    )
-    (dummy_inputs_orig, video, baseline, target_T, target_H, target_W, 
-     t_dim_index, crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig) = packed_inputs
-
-    # Pre-calculate anchors dynamically
-    mask_zeros = torch.zeros(num_tubes, device=model.device)
-    M_large_zeros = mask_zeros[tubelets_tensor].unsqueeze(1).float()
-    M_scaled_zeros, M_vol_zeros = rescale_mask(M_large_zeros, new_H, new_W, crop_top, crop_left, target_H, target_W, target_T, T_orig, is_qwen, t_dim_index)
-    _, anchor_base = evaluate_fitness(args, mode, M_scaled_zeros, M_vol_zeros, M_large_zeros, video, baseline, model, positions, full_ids, output_ids, dummy_inputs_orig)
-
-    mask_ones = torch.ones(num_tubes, device=model.device)
-    M_large_ones = mask_ones[tubelets_tensor].unsqueeze(1).float()
-    M_scaled_ones, M_vol_ones = rescale_mask(M_large_ones, new_H, new_W, crop_top, crop_left, target_H, target_W, target_T, T_orig, is_qwen, t_dim_index)
-    _, anchor_orig = evaluate_fitness(args, mode, M_scaled_ones, M_vol_ones, M_large_ones, video, baseline, model, positions, full_ids, output_ids, dummy_inputs_orig)
-
-    iterations = getattr(args, 'iterations', 250)
-    initial_temp = 1.0
-    final_temp = 0.01
-    cooling_rate = (final_temp / initial_temp) ** (1.0 / iterations)
-    
-    # For deletion: start with 90% of the video intact (mostly 1s).
-    # For insertion: start with 90% of the video masked (mostly 0s).
-    if mode == 'deletion':
-        current_mask = (torch.rand(num_tubes, device=model.device) > 0.1).float()
-    else:
-        current_mask = (torch.rand(num_tubes, device=model.device) > 0.9).float()
-    
-    M_large = current_mask[tubelets_tensor].unsqueeze(1).float()
-    M_scaled, M_vol = rescale_mask(M_large, new_H, new_W, crop_top, crop_left, 
-                                   target_H, target_W, target_T, T_orig, is_qwen, t_dim_index)
-    
-    current_fitness, current_conf = evaluate_fitness(
-        args, mode, M_scaled, M_vol, M_large, video, baseline, 
-        model, positions, full_ids, output_ids, dummy_inputs_orig,
-        anchor_base=anchor_base, anchor_orig=anchor_orig
-    )
-    
-    best_mask = current_mask.clone()
-    best_fitness = current_fitness
-    current_temp = initial_temp
-    target_margin = 0.05 
-
-    eprint(f"Starting SA | Mode: {mode} | Initial Temp: {initial_temp} | Iterations: {iterations}")
-
-    for generation in range(iterations):
-        # Dynamic neighborhood: flip more bits early on, fewer bits later
-        progress = generation / iterations
-        max_flips = 4 if progress < 0.3 else (2 if progress < 0.7 else 1)
-        num_flips = torch.randint(1, max_flips + 1, (1,)).item()
-        
-        neighbor_mask = current_mask.clone()
-        flip_indices = torch.randperm(num_tubes)[:num_flips]
-        neighbor_mask[flip_indices] = 1.0 - neighbor_mask[flip_indices] # Flip 0 to 1, or 1 to 0
-        
-        M_large_neigh = neighbor_mask[tubelets_tensor].unsqueeze(1).float()
-        M_scaled_neigh, M_vol_neigh = rescale_mask(M_large_neigh, new_H, new_W, crop_top, crop_left, 
-                                                   target_H, target_W, target_T, T_orig, is_qwen, t_dim_index)
-        
-        neighbor_fitness, neighbor_conf = evaluate_fitness(
-            args, mode, M_scaled_neigh, M_vol_neigh, M_large_neigh, video, baseline, 
-            model, positions, full_ids, output_ids, dummy_inputs_orig,
-            anchor_base=anchor_base, anchor_orig=anchor_orig
-        )
-        
-        if mode == 'deletion' and abs(neighbor_conf - anchor_base) < target_margin:
-            eprint(f"Target confidence destroyed (within {target_margin} of baseline) at pass {generation}. Stopping early.")
-            best_mask = neighbor_mask
-            best_fitness = neighbor_fitness
-            break
-        elif mode == 'insertion' and abs(neighbor_conf - anchor_orig) < target_margin:
-            eprint(f"Target confidence recovered (within {target_margin} of original) at pass {generation}. Stopping early.")
-            best_mask = neighbor_mask
-            best_fitness = neighbor_fitness
-            break
-
-        # Acceptance logic (Metropolis Criterion)
-        delta = neighbor_fitness - current_fitness
-        
-        if delta < 0:
-            # Better solution: accept always
-            accept = True
-        else:
-            # Worse solution: accept with probability exp(-delta / Temp)
-            acceptance_probability = torch.exp(-torch.tensor(delta) / current_temp).item()
-            accept = np.random.rand() < acceptance_probability
-            
-        if accept:
-            current_mask = neighbor_mask
-            current_fitness = neighbor_fitness
-            
-            if current_fitness < best_fitness:
-                best_fitness = current_fitness
-                best_mask = current_mask.clone()
-                eprint(f"Gen {generation} | NEW BEST | Fit: {best_fitness:.4f} | Conf: {neighbor_conf:.4f} | Temp: {current_temp:.4f}")
-
-        current_temp *= cooling_rate
-
-    W_final = best_mask.cpu().numpy()
-    
-    # Calculate scores based on the mode.
-    # For deletion: 1.0 means we kept it, 0.0 means we deleted it. We score what was deleted.
-    # For insertion: 1.0 means we inserted it, 0.0 means we left it blank. We score what was inserted.
-    if mode == 'deletion':
-        scores = {t: float(1.0 - W_final[t]) for t in range(num_tubes)}
-    else:
-        scores = {t: float(W_final[t]) for t in range(num_tubes)}
-
-    # Since it's a binary mask, everything scored 1.0 was selected.
-    selected_tubelets = [t for t, s in scores.items() if s > 0.5]
-    
-    metrics = {
-        "sa_evals": generation + 1, 
-        "best_fitness": best_fitness
-    }
-
     return selected_tubelets, scores, metrics

@@ -18,6 +18,8 @@ def init_args():
     parser.add_argument('--num_videos', type=int, default=5)
     parser.add_argument('--popsize', type=int, default=20)
     parser.add_argument('--normalize_weights', type=lambda x: (str(x).lower() == 'true'), default=True)
+    parser.add_argument('--randomize_data', type=lambda x: (str(x).lower() == 'true'), default=False)
+
 
     parser.add_argument(
         '--model',

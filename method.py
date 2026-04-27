@@ -11,8 +11,8 @@ import random
 import itertools
 import gc
 
-from cmaes import CMA_ES, SimulatedAnnealing_optimization
-from surrogate_es import SAEA_CMA_ES
+from cmaes import CMA_ES
+from ig_optimizer import optimize_tubelet_weights
 
 def spix_rise_perturbation(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None, num_masks=50, p=0.5):
     """
@@ -252,37 +252,6 @@ def spix_hierarchical_cmaes(args, model, tokenizer, processor, input_ids, output
 
     return selected_ins, selected_del, final_scores_ins, final_scores_del, insertion_metrics, deletion_metrics
 
-def spix_simulated_annealing(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None):
-    """
-    Optimizes deletion and insertion masks using a single-pass Simulated Annealing global search.
-    """
-    video_array = np.stack([np.array(img) for img in frames])
-    full_ids = torch.cat((input_ids, output_ids), dim=1)
-    is_qwen = getattr(args, 'model', '') == 'qwen'
-    
-    # -- Generate Base Canvases
-    baseline_ins = get_baseline_insertion(args, video_array) 
-    baseline_del = get_baseline_deletion(args, video_array)  
-    
-    frames_orig = [Image.fromarray(f.astype(np.uint8)) for f in video_array]
-    frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
-    frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
-
-    # --- 1. Deletion Optimization ---
-    eprint("\n--- Starting SA Deletion Optimization ---")
-    selected_del, scores_del, deletion_metrics = SimulatedAnnealing_optimization(
-        args, model, processor, tokenizer, full_ids, output_ids, 
-        frames_orig, frames_del_base, tubelets, positions=positions, mode='deletion'
-    )
-
-    # --- 2. Insertion Optimization ---
-    eprint("\n--- Starting SA Insertion Optimization ---")
-    selected_ins, scores_ins, insertion_metrics = SimulatedAnnealing_optimization(
-        args, model, processor, tokenizer, full_ids, output_ids, 
-        frames_orig, frames_ins_base, tubelets, positions=positions, mode='insertion'
-    )
-
-    return selected_ins, selected_del, scores_ins, scores_del, insertion_metrics, deletion_metrics
 
 def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None, max_stages=2, discount_factor=0.75, index=1):
     """
@@ -422,86 +391,6 @@ def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output
         stage += 1
 
     return list(accumulated_ins), list(accumulated_del), final_scores_ins, final_scores_del, insertion_metrics, deletion_metrics 
-
-# def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None, stages=3, iters_per_stage=20, index=1):
-#     """
-#     Optimize two separate masks. 'Whack-a-Mole Optimization'
-#         - We run gradient descent in multiple stages (with args.iterations per stage)
-#         - Each stage, highest scoring tublets are masked (or revealed for insertion)
-#         - We force the optimizer to find secondary and tertiary evidence in subsequent stages
-#     """
-#     video_array = np.stack([np.array(img) for img in frames])
-#     full_ids = torch.cat((input_ids, output_ids), dim=1)
-    
-#     # -- Generate Base Canvases
-#     baseline_ins = get_baseline_insertion(args, video_array) 
-#     baseline_del = get_baseline_deletion(args, video_array)  
-
-#     # -- State Tracking
-#     accumulated_ins = set()
-#     accumulated_del = set()
-#     final_scores_ins = {}
-#     final_scores_del = {}
-
-#     # -- Insetion Optimization
-#     eprint(f"\n--- Starting Iterative Insertion Optimization ({args.stages} Stages) ---")
-#     current_baseline_ins = baseline_ins.copy()
-#     for stage in range(1, args.stages + 1):
-#         eprint(f"\n>> [Insertion Stage {stage}/{args.stages}]")
-#         #Update baseline (shows previously found tubelets)
-#         frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in current_baseline_ins]
-        
-#         # -- Main Weight Optimization Loop
-#         selected, scores = optimize_tubelet_weights(
-#             args, model, tokenizer, processor, full_ids, output_ids, frames, frames_ins_base, 
-#             tubelets, positions, mode='insertion', stage=f"{index}-{stage}-insertion") 
-
-#         # -- Evaluation. Record highest score a tubelet achieved across all stages
-#         for t, s in scores.items():
-#             final_scores_ins[t] = max(final_scores_ins.get(t, 0), s)
-#         # -- Filtering & Recording Inside Set
-#         new_selected = [t for t in selected if t not in accumulated_ins]
-#         if not new_selected:
-#             eprint("No new tubelets found. Stopping insertion stages early.")
-#             break
-#         accumulated_ins.update(new_selected)
-
-#         # -- Update Basline: Reveal newly selected tubelets
-#         mask = np.isin(tubelets, list(accumulated_ins))[..., np.newaxis]
-#         current_baseline_ins = np.where(mask, video_array, baseline_ins)
-
-
-#     # -- Deletion Optimization
-#     eprint(f"\n--- Starting Iterative Deletion Optimization ({args.stages} Stages) ---")
-#     current_video_del = video_array.copy()
-#     for stage in range(1, args.stages + 1):
-#         eprint(f"\n>> [Deletion Stage {stage}/{args.stages}]")
-#         #Update baseline (hides previously found tubelets)
-#         frames_current_video = [Image.fromarray(f.astype(np.uint8)) for f in current_video_del]
-#         frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
-
-#         # -- Main Weight Optimization Loop
-#         selected, scores = optimize_tubelet_weights(
-#             args, model, tokenizer, processor, full_ids, output_ids, frames_current_video, frames_del_base, 
-#             tubelets, positions, mode='deletion', stage=f"{index}-{stage}-deletion")
-
-#         # -- Evaluation. Record highest score a tubelet achieved across all stages
-#         for t, s in scores.items():
-#             final_scores_del[t] = max(final_scores_del.get(t, 0), s)
-#         # -- Filtering & Recording Inside Set
-#         new_selected = [t for t in selected if t not in accumulated_del]
-#         if not new_selected:
-#             eprint("No new tubelets found. Stopping deletion stages early.")
-#             break
-#         accumulated_del.update(new_selected)
-
-#         # -- Update the target video: mask the newly selected tubelets
-#         mask = np.isin(tubelets, list(accumulated_del))[..., np.newaxis]
-#         current_video_del = np.where(mask, baseline_del, video_array)
-
-#     return list(accumulated_ins), list(accumulated_del), final_scores_ins, final_scores_del
-
-
 
 def frame_redundancy(args, model, processor, input_ids, output_ids, frames, compute_interactions=True):
     """

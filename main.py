@@ -33,11 +33,10 @@ from method_helpers import *
 from method_helpers import _get_rescale_and_dummys
 from method import (
     spix_cmaes, 
+    spix_hierarchical_cmaes,
     spix_gradient_iterative, 
     spix_rise_perturbation, 
     frame_redundancy, 
-    spix_simulated_annealing,
-    spix_hierarchical_cmaes
 )
 from args import init_args
 from iGOS.method import iGOS_p, perform_igos
@@ -67,23 +66,23 @@ def xai_method(args, model, tokenizer, processor, input_ids, output_ids, frames,
             positions=positions, max_stages=getattr(args, 'max_stages', 2), index=ivd
         )
     else:
-        return spix_simulated_annealing(
+        return spix_rise_perturbation(
              args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets,
              positions=positions
         )
+
+
 
 def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets, 
                      baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, 
                      special_ids, input_ids, output_ids, question_text, ground_truth, model_answer, 
                      target_text, ivd, log_func, mode_name, file_prefix):
     """
-    Runs XAI pipeline and handles logging
+    Runs XAI pipeline for a single video and handles logging
     """
     start = time.time()
-    full_ids = torch.cat((input_ids, output_ids), dim=1)
-    unique_tubes = np.unique(tubelets)
 
-    eprint(f"{ivd+1}/{args.num_videos}: Selecting Important Tubelets ({mode_name}).")
+    eprint(f"{ivd+1}/{args.num_videos}: Selecting Keywords ({mode_name}).")
     positions, keywords = find_keywords(
         args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, 
         target_text, tokenizer=tokenizer, use_yake=args.use_yake, special_ids=special_ids
@@ -93,28 +92,26 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         auc_ins, auc_del = perform_igos()
         return auc_ins, auc_del, auc_ins, auc_del
 
-    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
-    prob_baseline_del = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions)
-    prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions)
-
-    eprint(f"{ivd+1}/{args.num_videos}: Optimizing weights")
+    eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
     selected_ins, selected_del, scores_ins, scores_del, insertion_metrics, deletion_metrics = xai_method(
         args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, 
         baseline_ins_arr, baseline_del_arr, positions, ivd
     )
-
-    #Unite the masks (both intersection and union)
-    # raw_union = set(selected_ins) | set(selected_del)
-    # raw_inter = set(selected_ins) & set(selected_del)
-    # selected_union, _ = merge_masks_borda(selected_ins, selected_del, list(raw_union))
-    # selected_inter, _ = merge_masks_borda(selected_ins, selected_del, list(raw_inter))
+    
+    # Merging mask
     scores_merged = {}
+    unique_tubes = np.unique(tubelets)
     for t in unique_tubes:
-        # Multiply the continuous scores (Logical AND / Intersection)
         scores_merged[t] = scores_ins.get(t, 0.0) * scores_del.get(t, 0.0)
     selected_merged = sorted(list(unique_tubes), key=lambda t: scores_merged[t], reverse=True)
 
-    # For evaluation, we show what happens when deleting / inserting our mask! 
+    # Evaluation (calculating metrics, etc.)
+    full_ids = torch.cat((input_ids, output_ids), dim=1)
+    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
+    prob_baseline_del = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions)
+    prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions)
+
+    # For evaluation, we show what happens when deleting / inserting our mask!
     k_fraction = 0.50
     k_tubes = max(1, int(len(unique_tubes) * k_fraction))
 
@@ -143,7 +140,6 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         deletion_metrics, insertion_metrics, top_k, fmt_ins, fmt_del, fmt_merged, 
         selected_ins, selected_del, selected_merged, unique_tubes, k_fraction, mode_name, start_time
     )
-
 
     if getattr(args, 'save_visuals', True):
         eprint(f"{ivd+1}/{args.num_videos}: Visualizing the Masked Tubelets ({mode_name}).")
@@ -174,7 +170,7 @@ def explain_data(data, model, processor, args, tokenizer):
     param tokenizer: "  "  alongside the model
     for each datapoint, runs XAI pipeline
     """
-    # Set up logging structure
+    # First we set up logging structure
     now = datetime.datetime.now() 
     setting = f'{now.month}{now.day}-{now.hour}{now.minute}'
     out_dir = os.path.join(args.output_dir, setting)
@@ -188,25 +184,28 @@ def explain_data(data, model, processor, args, tokenizer):
             f.write(str(msg) + "\n")
 
     num_videos = min(len(data), args.num_videos) if args.num_videos > 0 else len(data)
-    global_metrics = []# {k: [] for k in ["auc_ins", "auc_del", "gt_auc_ins", "gt_auc_del"]}
+    global_metrics = []
     global_gt_metrics = []
 
-    #shuffle data here if random random
+    if args.randomize_data == True:
+        random.shuffle(data)
+
+
     for ivd in range(1,num_videos):
         eprint(f"\n{ivd+1}/{num_videos}: Retrieving data.")
         start = time.time()
-        idx = random.randint(0, len(data)-1) if args.dataset == 'k400' else ivd # Randomize dat
+
         #Load current question, frame and ground truth (if avail)
         try:
-            frames, qs, cur_prompt, correct_idx = get_data(args, data[idx])
+            frames, qs, cur_prompt, correct_idx = get_data(args, data[ivd])
             ground_truth_label = str(correct_idx)
             prompt = f"USER: {DEFAULT_VIDEO_TOKEN}\n{qs}. ASSISTANT:"
         except Exception as e:
-            eprint(f"Error loading row {idx}: {e}")
+            eprint(f"Error loading row {ivd}: {e}")
             continue
         eprint(f"Retrieved data in {time.time() - start:.2f}s")
 
-        #Create tubelets
+        eprint(f"{ivd+1}/{args.num_videos}: Creating Tubelets and Baseline Frames ({mode_name}).")
         video_array, tubelets = generate_tubelets_optimized(frames, args)
         #Get original answer of the model (with token IDs)
         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
@@ -229,8 +228,6 @@ def explain_data(data, model, processor, args, tokenizer):
             mode_name="STANDARD", file_prefix=""
         )
         global_metrics.append(metrics)
-        # global_metrics["auc_ins"].append(metrics[0])
-        # global_metrics["auc_del"].append(metrics[1])
 
         if getattr(args, 'gt_forcing', False):    
             gt_ids = tokenizer(ground_truth_label, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)
