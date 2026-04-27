@@ -111,7 +111,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     prob_baseline_del = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions)
     prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions)
 
-    # For evaluation, we show what happens when deleting / inserting our mask!
+    # ... for evaluation, we show what happens when deleting / inserting our mask!
     k_fraction = 0.50
     k_tubes = max(1, int(len(unique_tubes) * k_fraction))
 
@@ -135,10 +135,10 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     )
     
     #All the data will be logged in log.txt
-    log_experiment(args, metrics, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
+    log_experiment(args, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
         prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, auc_ins, auc_del,
         deletion_metrics, insertion_metrics, top_k, fmt_ins, fmt_del, fmt_merged, 
-        selected_ins, selected_del, selected_merged, unique_tubes, k_fraction, mode_name, start_time
+        selected_ins, selected_del, selected_merged, unique_tubes, k_fraction, mode_name, start
     )
 
     if getattr(args, 'save_visuals', True):
@@ -190,8 +190,7 @@ def explain_data(data, model, processor, args, tokenizer):
     if args.randomize_data == True:
         random.shuffle(data)
 
-
-    for ivd in range(1,num_videos):
+    for ivd in range(num_videos):
         eprint(f"\n{ivd+1}/{num_videos}: Retrieving data.")
         start = time.time()
 
@@ -205,7 +204,7 @@ def explain_data(data, model, processor, args, tokenizer):
             continue
         eprint(f"Retrieved data in {time.time() - start:.2f}s")
 
-        eprint(f"{ivd+1}/{args.num_videos}: Creating Tubelets and Baseline Frames ({mode_name}).")
+        eprint(f"{ivd+1}/{args.num_videos}: Creating Tubelets and Baseline Frames.")
         video_array, tubelets = generate_tubelets_optimized(frames, args)
         #Get original answer of the model (with token IDs)
         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
