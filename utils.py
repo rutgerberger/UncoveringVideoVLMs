@@ -190,6 +190,7 @@ def get_baseline_insertion(args, video_array):
 def get_baseline_deletion(args, video_array):
     """Returns the masking canvas used for Deletion metrics (White)."""
     #return np.zeros_like(video_array)
+    return get_baseline_insertion(args, video_array)
     return np.full_like(video_array, 255) # Constant white video
 
 def apply_universal_mask(foreground_array, background_array, tubelets, active_tubes):
@@ -220,7 +221,7 @@ def get_data(args, row):
 
     # -- ImageNet Data Handling
     if getattr(args, 'dataset', '') == 'imagenet':
-        question_text = "If you were a classifier trained on ImageNet, what object is in this video? Answer with only the class name."
+        question_text = "If you were a classifier trained on ImageNet, what object is in this video? Answer with only the class name (use spaces to separate multiple words)."
         cur_prompt = question_text
         options_prompt = ""
         qs = cur_prompt
@@ -305,7 +306,7 @@ def get_data(args, row):
         end_time = str(row['time_end']).zfill(6)
         video_filename = f"{yt_id}_{start_time}_{end_time}.mp4"
         video_path = os.path.join(args.video_folder, "val", video_filename)
-        question_text = "What type of activity is happening in this video? Answer with only the action class name."
+        question_text = "What type of activity is happening in this video? Answer with only the action class name (use spaces to separate multiple words)"
         cur_prompt = question_text
         options_prompt = "N/A (Open-ended)"
         qs = cur_prompt
@@ -365,6 +366,83 @@ def get_data(args, row):
     
     return video, qs, cur_prompt, correct_idx
 
+def log_experiment(args, metrics, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
+                   prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, auc_ins, auc_del,
+                   deletion_metrics, insertion_metrics, top_k, fmt_ins, fmt_del, fmt_merged, 
+                   selected_ins, selected_del, selected_merged, unique_tubes, k_fraction, mode_name, start_time):
+
+    """Handles single experiment logging"""
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    metrics_file = os.path.join(args.output_dir, "frame_experiment_metrics.jsonl")
+    experiment_data = {
+        "video_index": ivd,
+        "num_frames": args.num_frames,
+        "Prob orig": round(prob_orig,3),
+        "Prob_baseline_del": round(prob_baseline_del,3),
+        "Prob_baseline_ins": round(prob_baseline_ins,3),
+        "Prob ins": round(prob_ins,3),
+        "Prob del": round(prob_del,3),
+        "AUC Ins": round(auc_ins,3),
+        "AUC Del": round(auc_del,3),
+        "deletion_metrics": deletion_metrics,
+        "insertion_metrics": insertion_metrics,
+    }
+    
+    with open(metrics_file, "a") as f:
+        f.write(json.dumps(experiment_data) + "\n")
+
+    log_func("-" * 25)
+    log_func(f"Question {ivd+1}/{args.num_videos}: {question_text}")
+    log_func(f"Ground Truth: {ground_truth}")
+    log_func(f"Model Answer: {model_answer}")
+    log_func(f"Extracted Keywords: {keywords} (Positions: {positions})")
+    log_func("-" * 25)
+    log_func(f"Original probs: {prob_orig:.5f}")
+    log_func(f"baseline_del probs: {prob_baseline_del:.5f}")
+    log_func(f"baseline_ins probs: {prob_baseline_ins:.5f}\n")
+
+    log_func(f"=== {mode_name} Tubelets Search Log ===")
+    log_func(f"Created tubelets and optimized weights in {(time.time() - start_time):.2f}s") # <-- Updated to start_time
+    log_func(f"Final Insertion tubelets (Top {top_k}): {fmt_ins} ({len(selected_ins)}/{len(unique_tubes)})")
+    log_func(f"Final Deletion tubelets (Top {top_k}): {fmt_del} ({len(selected_del)}/{len(unique_tubes)})")
+    log_func(f"Final Combined tubelets (Top {top_k}): {fmt_merged} ({len(selected_merged)}/{len(unique_tubes)})")
+    log_func(f"Prob when Inserting Mask (top {k_fraction*100}%): {prob_ins:.5f} (Diff: {prob_orig - prob_ins:.5f})")
+    log_func(f"Prob when Deleting Mask (top {k_fraction*100}%): {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
+
+    log_func(f"\n=== Experiment Metrics ===\n")
+    log_func(f"Insertion Landscape -> d_eff: {insertion_metrics.get('d_eff', 0):.2f} | Diversity (L1): {insertion_metrics.get('diversity', 0):.4f} (from {insertion_metrics.get('num_top_candidates', 0)} top masks)")
+    log_func(f"Deletion Landscape  -> d_eff: {deletion_metrics.get('d_eff', 0):.2f} | Diversity (L1): {deletion_metrics.get('diversity', 0):.4f} (from {deletion_metrics.get('num_top_candidates', 0)} top masks)")
+    log_func(f"\nAUC Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
+
+
+def log_metrics(args, metrics, prefix=""):
+    """dump experiment metrics in log file"""
+        
+    with open(os.path.join(args.output_dir, f'{prefix}final_metrics.json'), 'w') as f: # <-- Appended prefix to filename to prevent overwrite
+        p_orig = np.array([m['prob_orig'] for m in metrics])
+        p_del = np.array([m['prob_del'] for m in metrics])
+        p_b_del = np.array([m['prob_baseline_del'] for m in metrics])
+        p_ins = np.array([m['prob_ins'] for m in metrics])
+        p_b_ins = np.array([m['prob_baseline_ins'] for m in metrics])
+        
+        # Calculate average probability differences
+        avg_prob_diff_del_topx = np.mean(p_orig - p_del)
+        avg_prob_diff_del_blur = np.mean(p_orig - p_b_del)
+        avg_prob_diff_ins_topx = np.mean(p_ins - p_b_ins)
+        avg_prob_diff_ins_orig = np.mean(p_orig - p_b_ins)
+        
+        summary = {
+            f"{prefix}avg_auc_ins": float(np.mean([m['auc_ins'] for m in metrics])),
+            f"{prefix}avg_auc_del": float(np.mean([m['auc_del'] for m in metrics])),
+            f"{prefix}avg_prob_diff_del_topx": float(avg_prob_diff_del_topx),
+            f"{prefix}avg_prob_diff_del_blur": float(avg_prob_diff_del_blur),
+            f"{prefix}avg_prob_diff_ins_topx": float(avg_prob_diff_ins_topx),
+            f"{prefix}avg_prob_diff_ins_orig": float(avg_prob_diff_ins_orig),
+            f"{prefix}prob_del_explained": float(avg_prob_diff_del_topx / avg_prob_diff_del_blur) if avg_prob_diff_del_blur != 0 else 0.0,
+            f"{prefix}prob_ins_explained": float(avg_prob_diff_ins_topx / avg_prob_diff_ins_orig) if avg_prob_diff_ins_orig != 0 else 0.0,
+        }
+        json.dump(summary, f, indent=4)
 # -- VLM utils
 
 def generate_qwen(args, model, processor, prompt: str, frames):

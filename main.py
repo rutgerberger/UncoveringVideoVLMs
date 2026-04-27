@@ -36,7 +36,8 @@ from method import (
     spix_gradient_iterative, 
     spix_rise_perturbation, 
     frame_redundancy, 
-    spix_simulated_annealing
+    spix_simulated_annealing,
+    spix_hierarchical_cmaes
 )
 from args import init_args
 from iGOS.method import iGOS_p, perform_igos
@@ -55,7 +56,12 @@ def xai_method(args, model, tokenizer, processor, input_ids, output_ids, frames,
             args, model, tokenizer, processor, input_ids, output_ids, 
             frames, tubelets, baseline_ins_arr, baseline_del_arr, positions=positions
         )
-    elif method == 'gradient_iterative':
+    elif method == 'hierarchical_cmaes':
+        return spix_hierarchical_cmaes(
+            args, model, tokenizer, processor, input_ids, output_ids, 
+            frames, tubelets, baseline_ins_arr, baseline_del_arr, positions=positions
+        )
+    elif method == 'spix':
         return spix_gradient_iterative(
             args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets,
             positions=positions, max_stages=getattr(args, 'max_stages', 2), index=ivd
@@ -66,7 +72,7 @@ def xai_method(args, model, tokenizer, processor, input_ids, output_ids, frames,
              positions=positions
         )
 
-def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tubelets, 
+def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets, 
                      baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, 
                      special_ids, input_ids, output_ids, question_text, ground_truth, model_answer, 
                      target_text, ivd, log_func, mode_name, file_prefix):
@@ -108,7 +114,8 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
         scores_merged[t] = scores_ins.get(t, 0.0) * scores_del.get(t, 0.0)
     selected_merged = sorted(list(unique_tubes), key=lambda t: scores_merged[t], reverse=True)
 
-    k_fraction = 0.20
+    # For evaluation, we show what happens when deleting / inserting our mask! 
+    k_fraction = 0.50
     k_tubes = max(1, int(len(unique_tubes) * k_fraction))
 
     top_final = selected_merged[:k_tubes]
@@ -123,43 +130,20 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
     fmt_ins = {t: f"{scores_ins.get(t, 0):.4f}" for t in selected_ins[:top_k]}
     fmt_del = {t: f"{scores_del.get(t, 0):.4f}" for t in selected_del[:top_k]}
     fmt_merged = {t: f"{scores_merged.get(t, 0):.4f}" for t in selected_merged[:top_k]}
-
-    log_func("-" * 25)
-    log_func(f"Question {ivd+1}/{args.num_videos}: {question_text}")
-    log_func(f"Ground Truth: {ground_truth}")
-    log_func(f"Model Answer: {model_answer}")
-    log_func(f"Extracted Keywords: {keywords} (Positions: {positions})")
-    log_func("-" * 25)
-    log_func(f"Original probs: {prob_orig:.5f}")
-    log_func(f"baseline_del probs: {prob_baseline_del:.5f}")
-    log_func(f"baseline_ins probs: {prob_baseline_ins:.5f}\n")
-
-    log_func(f"=== {mode_name} Tubelets Search Log ===")
-    log_func(f"Created tubelets in {(time.time() - start):.2f}s")
-    log_func(f"Final Insertion tubelets (Top {top_k}): {fmt_ins} ({len(selected_ins)}/{len(unique_tubes)})")
-    log_func(f"Final Deletion tubelets (Top {top_k}): {fmt_del} ({len(selected_del)}/{len(unique_tubes)})")
-    log_func(f"Final Combined tubelets (Top {top_k}): {fmt_merged} ({len(selected_merged)}/{len(unique_tubes)})")
-    log_func(f"Prob when Inserting Mask (top 20%): {prob_ins:.5f} (Diff: {prob_orig - prob_ins:.5f})")
-    log_func(f"Prob when Deleting Mask (top 20%): {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
-
+ 
+    # Get AUC metrics
     auc_ins, auc_del = evaluate_auc(
         args, model, processor, full_ids, output_ids, frames, video_array, tubelets, 
         selected_merged, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_merged", positions=positions
     )
     
-    log_func(f"\nAUC Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
+    #All the data will be logged in log.txt
+    log_experiment(args, metrics, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
+        prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, auc_ins, auc_del,
+        deletion_metrics, insertion_metrics, top_k, fmt_ins, fmt_del, fmt_merged, 
+        selected_ins, selected_del, selected_merged, unique_tubes, k_fraction, mode_name, start_time
+    )
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    metrics_file = os.path.join(args.output_dir, "frame_experiment_metrics.jsonl")
-    experiment_data = {
-        "video_index": ivd,
-        "num_frames": args.num_frames,
-        "deletion_metrics": deletion_metrics,
-        "insertion_metrics": insertion_metrics,
-        "AUC Ins": auc_ins, "AUC Del": auc_del,
-    }
-    with open(metrics_file, "a") as f:
-        f.write(json.dumps(experiment_data) + "\n")
 
     if getattr(args, 'save_visuals', True):
         eprint(f"{ivd+1}/{args.num_videos}: Visualizing the Masked Tubelets ({mode_name}).")
@@ -170,84 +154,103 @@ def run_xai_pipeline(args, model, processor, tokenizer, frames, video_array, tub
         visualize_heatmap(video_array, tubelets, scores_ins, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_ins.gif"))
         visualize_heatmap(video_array, tubelets, scores_del, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_del.gif"))
         visualize_heatmap(video_array, tubelets, scores_merged, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_merged.gif"))
-        
-    return auc_ins, auc_del
 
-def explain_vid(data, model, processor, args, tokenizer):
-    now = datetime.datetime.now()
+    return {
+        "auc_ins": auc_ins,
+        "auc_del": auc_del,
+        "prob_orig": prob_orig,
+        "prob_baseline_del": prob_baseline_del,
+        "prob_baseline_ins": prob_baseline_ins,
+        "prob_ins": prob_ins,
+        "prob_del": prob_del
+    }
+
+def explain_data(data, model, processor, args, tokenizer):
+    """
+    param data: pre-loaded list of data points (dict) - packed with get_data util
+    param model: HF VLM model
+    param processor: processor alongside the model
+    param args: run arguments
+    param tokenizer: "  "  alongside the model
+    for each datapoint, runs XAI pipeline
+    """
+    # Set up logging structure
+    now = datetime.datetime.now() 
     setting = f'{now.month}{now.day}-{now.hour}{now.minute}'
     out_dir = os.path.join(args.output_dir, setting)
     args.output_dir = out_dir
     os.makedirs(args.output_dir, exist_ok=True)
-    
     with open(os.path.join(out_dir, 'args.json'), 'w') as f:
         json.dump(vars(args), f, indent=4)
-
     log_file = os.path.join(args.output_dir, "log.txt")
     def log(msg):
         with open(log_file, "a") as f:
             f.write(str(msg) + "\n")
 
     num_videos = min(len(data), args.num_videos) if args.num_videos > 0 else len(data)
-    global_metrics = {k: [] for k in ["auc_ins", "auc_del", "gt_auc_ins", "gt_auc_del"]}
-    
+    global_metrics = []# {k: [] for k in ["auc_ins", "auc_del", "gt_auc_ins", "gt_auc_del"]}
+    global_gt_metrics = []
+
+    #shuffle data here if random random
     for ivd in range(1,num_videos):
         eprint(f"\n{ivd+1}/{num_videos}: Retrieving data.")
         start = time.time()
-        idx = random.randint(0, len(data)-1) if args.dataset == 'k400' else ivd
-        
+        idx = random.randint(0, len(data)-1) if args.dataset == 'k400' else ivd # Randomize dat
+        #Load current question, frame and ground truth (if avail)
         try:
             frames, qs, cur_prompt, correct_idx = get_data(args, data[idx])
+            ground_truth_label = str(correct_idx)
+            prompt = f"USER: {DEFAULT_VIDEO_TOKEN}\n{qs}. ASSISTANT:"
         except Exception as e:
             eprint(f"Error loading row {idx}: {e}")
             continue
-            
         eprint(f"Retrieved data in {time.time() - start:.2f}s")
-        ground_truth_label = str(correct_idx)
 
+        #Create tubelets
         video_array, tubelets = generate_tubelets_optimized(frames, args)
-        prompt = f"USER: {DEFAULT_VIDEO_TOKEN}\n{qs}. ASSISTANT:"
+        #Get original answer of the model (with token IDs)
         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
-
+        special_ids = [idx for idx in [tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id] if idx is not None]
+        #Obtain baseline videos (and save if desired)- we do it here once (saves time)
         baseline_ins_arr = get_baseline_insertion(args, video_array)
         baseline_del_arr = get_baseline_deletion(args, video_array)
         baseline_ins_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins_arr]
         baseline_del_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del_arr]
-        special_ids = [idx for idx in [tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id] if idx is not None]
-
         if getattr(args, 'save_visuals', True):
             eprint(f"Visualizing baseline frames for video {ivd}...")
             visualize_frames(baseline_ins_frames, os.path.join(args.output_dir, f"{ivd}_baseline_insertion.gif"))
             visualize_frames(baseline_del_frames, os.path.join(args.output_dir, f"{ivd}_baseline_deletion.gif"))
 
-        metrics = run_xai_pipeline(
+        #Main pipeline
+        metrics = explain_vid(
             args, model, processor, tokenizer, frames, video_array, tubelets, 
             baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, special_ids,
             input_ids, output_ids, qs, ground_truth_label, output_text, output_text, ivd, log, 
             mode_name="STANDARD", file_prefix=""
         )
-
-        global_metrics["auc_ins"].append(metrics[0])
-        global_metrics["auc_del"].append(metrics[1])
+        global_metrics.append(metrics)
+        # global_metrics["auc_ins"].append(metrics[0])
+        # global_metrics["auc_del"].append(metrics[1])
 
         if getattr(args, 'gt_forcing', False):    
             gt_ids = tokenizer(ground_truth_label, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)
             if gt_ids is not None:
-                res_gt = run_xai_pipeline(
+                gt_metrics = explain_vid(
                     args, model, processor, tokenizer, frames, video_array, tubelets, 
                     baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, special_ids,
                     input_ids, gt_ids, qs, ground_truth_label, output_text, ground_truth_label, ivd, log, 
                     mode_name="GROUND TRUTH", file_prefix="gt_"
                 )
-                global_metrics["gt_auc_ins"].append(res_gt[0])
-                global_metrics["gt_auc_del"].append(res_gt[1])
+                global_gt_metrics.append(gt_metrics)
 
         gc.collect()
         torch.cuda.empty_cache()
 
-    with open(os.path.join(args.output_dir, 'final_metrics.json'), 'w') as f:
-        summary = {k: float(np.mean(v)) if v else 0.0 for k, v in global_metrics.items()}
-        json.dump(summary, f, indent=4)
+    if global_metrics:
+        log_metrics(args, global_metrics)
+    if global_gt_metrics:
+        log_metrics(args, global_gt_metrics, prefix="GT-")
+
     eprint(f"\nExperiment Complete. Mean metrics saved to {args.output_dir}/final_metrics.json")
 
 if __name__ == "__main__":
@@ -313,4 +316,4 @@ if __name__ == "__main__":
     else:
         data = load_dataset(args.data_path, "val")["val"].to_pandas().to_dict(orient="records")
         
-    explain_vid(data, model, processor, args, tokenizer)
+    explain_data(data, model, processor, args, tokenizer)

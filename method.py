@@ -164,6 +164,94 @@ def spix_cmaes(args, model, tokenizer, processor, input_ids, output_ids, frames,
 
     return selected_ins, selected_del, scores_ins, scores_del, insertion_metrics, deletion_metrics
 
+def spix_hierarchical_cmaes(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins, baseline_del, positions=None):
+    """
+    Two-Stage Curriculum Learning Optimization.
+    Stage 1: Coarse optimization on Super-Tubelets.
+    Stage 2: Fine optimization on unpacked Sub-Tubelets.
+    """
+    full_ids = torch.cat((input_ids, output_ids), dim=1)
+    frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
+    frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
+    frames_orig = [Image.fromarray(np.array(img).astype(np.uint8)) for img in frames]
+    video_array = np.stack([np.array(img) for img in frames])
+
+    # Configuration
+    n_super = getattr(args, 'super_clusters', 12)
+    cluster_mode = getattr(args, 'cluster_mode', 'spatial') # 'spatial' or 'appearance'
+    freeze_losers = getattr(args, 'freeze_losers', False)
+    total_iters = getattr(args, 'iterations', 100)
+    stage_iters = total_iters // 2
+    init_pop_size = getattr(args, 'popsize', 22)
+
+    eprint(f"--- Building Super-Tubelets ({n_super} clusters, mode: {cluster_mode}) ---")
+    super_tubelets, sub_to_super_map = create_super_tubelets(video_array, tubelets, n_clusters=n_super, mode=cluster_mode)
+
+    #First we do coarse optimization
+    eprint(f"Starting Deletion Optimization (Coarse)")
+    _, super_scores_del, _ = CMA_ES(
+        args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_del_base, 
+        super_tubelets, positions=positions, mode='deletion', max_iters=stage_iters, popsize=init_pop_size
+    )
+    
+    eprint(f"Starting Insertion Optimization (Coarse)")
+    _, super_scores_ins, _ = CMA_ES(
+        args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_ins_base, 
+        super_tubelets, positions=positions, mode='insertion', max_iters=stage_iters, popsize=init_pop_size
+    )
+
+    #Update the smaller tubelets
+    num_sub_tubes = int(tubelets.max()) + 1
+    
+    #Unpack Super-Weights to Sub-Weights
+    #We must convert the 0-1 saliency scores back into the raw unbounded weights CMA-ES uses 
+    #(Inverse Sigmoid / Logit function). CMA-ES initialized deletion at 2.0 and insertion at -2.0.
+    init_weights_del = np.zeros(num_sub_tubes)
+    init_weights_ins = np.zeros(num_sub_tubes)
+    
+    for sub_id in range(num_sub_tubes):
+        super_id = sub_to_super_map[sub_id]
+        # Deletion score is (1 - sigmoid(W)), so W = -logit(score)
+        s_del = np.clip(super_scores_del.get(super_id, 0.5), 1e-4, 1 - 1e-4)
+        init_weights_del[sub_id] = -np.log(s_del / (1 - s_del))
+        # Insertion score is sigmoid(W), so W = logit(score)
+        s_ins = np.clip(super_scores_ins.get(super_id, 0.5), 1e-4, 1 - 1e-4)
+        init_weights_ins[sub_id] = np.log(s_ins / (1 - s_ins))
+
+    #Freezing (Optional)
+    active_tubes_del = None
+    active_tubes_ins = None
+    if freeze_losers:
+        eprint("Freezing bottom 50% of coarse regions...")
+        # Only keep sub-tubelets whose parent score was above the median
+        med_del = np.median(list(super_scores_del.values()))
+        active_tubes_del = [sub_id for sub_id in range(num_sub_tubes) if super_scores_del[sub_to_super_map[sub_id]] >= med_del]
+        
+        med_ins = np.median(list(super_scores_ins.values()))
+        active_tubes_ins = [sub_id for sub_id in range(num_sub_tubes) if super_scores_ins[sub_to_super_map[sub_id]] >= med_ins]
+
+    #Final stage: fine-grained optimization
+    
+    eprint(f"Starting Deletion Optimization (fine-grained)")
+    _, final_scores_del, deletion_metrics = CMA_ES(
+        args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_del_base, 
+        tubelets, positions=positions, mode='deletion', max_iters=stage_iters, 
+        initial_weights=init_weights_del, active_tubes=active_tubes_del, popsize=init_pop_size
+    )
+    
+    eprint(f"Starting Insertion Optimization (fine-grained)")
+    _, final_scores_ins, insertion_metrics = CMA_ES(
+        args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_ins_base, 
+        tubelets, positions=positions, mode='insertion', max_iters=stage_iters,
+        initial_weights=init_weights_ins, active_tubes=active_tubes_ins, popsize=init_pop_size
+    )
+
+    # Rank and Return
+    selected_ins = sorted(final_scores_ins.keys(), key=lambda t: final_scores_ins[t], reverse=True)
+    selected_del = sorted(final_scores_del.keys(), key=lambda t: final_scores_del[t], reverse=True)
+
+    return selected_ins, selected_del, final_scores_ins, final_scores_del, insertion_metrics, deletion_metrics
+
 def spix_simulated_annealing(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None):
     """
     Optimizes deletion and insertion masks using a single-pass Simulated Annealing global search.

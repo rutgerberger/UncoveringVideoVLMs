@@ -449,3 +449,35 @@ def optimize_tubelet_weights(
     }
 
     return selected_tubelets, scores, metrics
+
+from sklearn.cluster import KMeans
+
+def create_super_tubelets(video_array, tubelets, n_clusters=12, mode='spatial'):
+    """
+    Clusters N tubelets into K super-tubelets.
+    mode: 'spatial' (groups by physical proximity) or 'appearance' (groups by color)
+    """
+    num_tubes = int(tubelets.max()) + 1
+    features = np.zeros((num_tubes, 3)) 
+    for i in range(num_tubes):
+        mask = (tubelets == i)
+        if not np.any(mask): 
+            continue
+            
+        if mode == 'appearance':
+            # Mean RGB color
+            features[i] = video_array[mask].mean(axis=0)[:3]
+        elif mode == 'spatial':
+            # 3D Centroid (T, Y, X)
+            coords = np.argwhere(mask)
+            features[i] = coords.mean(axis=0) 
+
+    # Normalize features so K-Means treats all dimensions equally
+    features = (features - features.mean(axis=0)) / (features.std(axis=0) + 1e-5)
+    # Cluster into Super-Tubelets
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto').fit(features)
+    labels = kmeans.labels_ # Maps sub_id -> super_id
+    # Create the 3D Super-Tubelet mask
+    super_tubelets = labels[tubelets]
+    
+    return super_tubelets, labels
