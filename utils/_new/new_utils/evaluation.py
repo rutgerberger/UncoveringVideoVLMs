@@ -9,7 +9,7 @@ from PIL import Image
 from sklearn.metrics import auc
 
 from .logging import eprint
-from .model_utils import get_prob
+from .model_utils import get_prob, get_score_direct
 from .preprocessing import get_baseline_deletion, get_baseline_insertion
 
 def tv_norm_3d(mask, tv_beta=2):
@@ -25,107 +25,28 @@ def tv_norm_3d(mask, tv_beta=2):
     return tv_t + tv_h + tv_w
 
 
-
-def evaluate_fitness(
-    args, mode, M, M_vol, M_large, video, baseline, model, positions, full_ids, output_ids, dummy_inputs_orig,
-    anchor_base=0.0, anchor_orig=1.0
-    ):
-    
-    if mode == 'deletion': # M = what we want to keep
-        video_input = video * M + baseline * (1.0 - M)
-    else: # M = what we want to reveal
-        video_input = baseline * (1.0 - M) + video * M
-    
-    with torch.no_grad():
-        forward_kwargs = {
-            "input_ids": full_ids,
-            "attention_mask": torch.ones_like(full_ids).to(model.device),
-            "pixel_values_videos": video_input.to(dtype=model.dtype),
-            "use_cache": False
-        }
-        if getattr(args, 'model', '') == 'qwen':
-            forward_kwargs["video_grid_thw"] = dummy_inputs_orig["video_grid_thw"]
-            
-        outputs = model(**forward_kwargs)
-        logits = outputs.logits
-        out_len = output_ids.shape[-1]
-        target_logits = logits[:, -out_len - 1 : -1, :]
-        probs = torch.nn.functional.softmax(target_logits, dim=-1)
-        target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-        
-        if positions is not None and len(positions) > 0:
-            target_probs = target_probs[0, positions]
-        
-        if torch.isnan(target_probs).any():
-            score = anchor_base if mode == 'deletion' else anchor_orig
-        else:
-            score = torch.log(target_probs + 1e-7).sum().item()
-
-    tv_penalty_raw = tv_norm_3d(M_vol)
-    tv_penalty = tv_penalty_raw.item() if isinstance(tv_penalty_raw, torch.Tensor) else float(tv_penalty_raw)
-
-
-    if mode == 'deletion': # minimize log-likelihood (drive it to a large negative number)
-        L1_penalty = torch.mean(1.0 - M_large).item() # Penalize dropping 
-        fitness = score + args.reg_lambda * (L1_penalty + tv_penalty)
-    else: # maximize log-likelihood (push it closer to 0)
-        L1_penalty = torch.mean(M_large).item() # Penalize revealing 
-        fitness = -score + args.reg_lambda * (L1_penalty + tv_penalty)
-
-    return float(fitness), score
-
-# Inside evaluation.py
-
 def evaluate_fitness(
     args, M_scaled, M_vol, M_large, video, baseline, model, positions, full_ids, output_ids, dummy_inputs_orig,
     current_l2_weight=0.0
     ):
     
-    # 1. Deletion Pass (M keeps the background, blurs the salient object)
     video_del = video * M_scaled + baseline * (1.0 - M_scaled)
-    
-    # 2. Insertion Pass (1-M reveals the salient object, blurs the background)
     video_ins = baseline * M_scaled + video * (1.0 - M_scaled) 
 
     with torch.no_grad():
-        # --- Helper function to get log-likelihood for a specific video pass ---
-        def get_score(vid_input):
-            forward_kwargs = {
-                "input_ids": full_ids,
-                "attention_mask": torch.ones_like(full_ids).to(model.device),
-                "pixel_values_videos": vid_input.to(dtype=model.dtype),
-                "use_cache": False
-            }
-            if getattr(args, 'model', '') == 'qwen':
-                forward_kwargs["video_grid_thw"] = dummy_inputs_orig["video_grid_thw"]
-                
-            outputs = model(**forward_kwargs)
-            target_logits = outputs.logits[:, -output_ids.shape[-1] - 1 : -1, :]
-            probs = torch.nn.functional.softmax(target_logits, dim=-1)
-            target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-            
-            if positions is not None and len(positions) > 0:
-                target_probs = target_probs[0, positions]
-                
-            return torch.log(target_probs + 1e-7).sum().item()
+        score_del = get_score_direct(video_del, model, args, full_ids, output_ids, dummy_inputs_orig, positions)
+        score_ins = get_score_direct(video_ins, model, args, full_ids, output_ids, dummy_inputs_orig, positions)
 
-        # Execute both passes
-        score_del = get_score(video_del)
-        score_ins = get_score(video_ins)
-
-    # 3. Calculate GNC Regularization (M wants to be 1.0)
     tv_penalty_raw = tv_norm_3d(M_vol)
     tv_penalty = tv_penalty_raw.item() if isinstance(tv_penalty_raw, torch.Tensor) else float(tv_penalty_raw)
-    
     L1_penalty = torch.mean(torch.abs(1.0 - M_large)).item() 
-    L2_penalty = torch.mean((1.0 - M_large)**2).item() 
+    #L2_penalty = torch.mean((1.0 - M_large)**2).item() 
 
-    # 4. The Joint Objective (Equation 8)
     # Minimize deletion score, maximize insertion score (so minus score_ins)
-    fitness = score_del - score_ins + args.reg_lambda * (L1_penalty + tv_penalty) + (current_l2_weight * L2_penalty)
+    fitness = score_del - score_ins + args.reg_lambda * (L1_penalty + tv_penalty)# + (current_l2_weight * L2_penalty)
 
     return float(fitness), score_del, score_ins
-    
+
 def evaluate_confidence(model, processor, frames, input_ids, output_ids, is_qwen):
     """
     Evaluates the model's probability for the target output_ids.

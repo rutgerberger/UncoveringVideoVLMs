@@ -127,6 +127,37 @@ def get_prob(args, model, processor, full_ids, output_ids, frames, positions=Non
     return torch.log(target_probs + 1e-7).sum().item()
     #sreturn target_probs.mean().item()
 
+def get_score_direct(vid_input, model, args, full_ids, output_ids, dummy_inputs_orig, positions=None):
+    """
+    Directly calculates the log-likelihood score from a raw video tensor,
+    bypassing the HuggingFace processor for maximum optimization loop performance.
+    """
+    forward_kwargs = {
+        "input_ids": full_ids,
+        "attention_mask": torch.ones_like(full_ids).to(model.device),
+        "pixel_values_videos": vid_input.to(dtype=model.dtype),
+        "use_cache": False
+    }
+    
+    # Qwen requires explicit grid dimensions for its vision transformer
+    if getattr(args, 'model', '') == 'qwen':
+        forward_kwargs["video_grid_thw"] = dummy_inputs_orig["video_grid_thw"]
+        
+    outputs = model(**forward_kwargs)
+    
+    # Extract the logits corresponding exactly to the target response tokens
+    out_len = output_ids.shape[-1]
+    target_logits = outputs.logits[:, -out_len - 1 : -1, :]
+    
+    probs = torch.nn.functional.softmax(target_logits, dim=-1)
+    target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+    
+    # Filter by visually relevant tokens (if provided)
+    if positions is not None and len(positions) > 0:
+        target_probs = target_probs[0, positions]
+        
+    return torch.log(target_probs + 1e-7).sum().item()
+
 def get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, tubelets):
     """
     Given a huggingface VLM, its corresponding processor,
