@@ -17,7 +17,7 @@ from PIL import Image
 from decord import VideoReader, cpu
 from sklearn.cluster import KMeans
 
-from logging import eprint
+from .logging import eprint
 
 def timestamp_to_sec(timestamp):
     h, m, s = timestamp.split(':')
@@ -125,6 +125,45 @@ def generate_tubelets_optimized(video, args, downsample_factor=0.5):
         tubelet_labels = np.tile(frame_labels, (T, 1, 1))
         
     return video_array, tubelet_labels
+
+
+def rescale_mask(mask, new_H, new_W, crop_top, crop_left, target_H, target_W, target_T, T_orig, is_qwen, t_dim_index):
+    """
+    Resizes mask to input size of the VLM and returns both the formatted 
+    VLM tensor and the 5D volumetric tensor for TV norm calculation.
+    """
+    M_resized_step = F.interpolate(mask, size=(new_H, new_W), mode='bilinear', align_corners=False)
+    M_cropped_step = M_resized_step[:, :, crop_top:crop_top+target_H, crop_left:crop_left+target_W]
+    M_vol_step = M_cropped_step.permute(1, 0, 2, 3).unsqueeze(0) # (1, 1, T, H, W)
+    
+    if target_T != T_orig:
+        M_vol_step = F.interpolate(M_vol_step, size=(target_T, target_H, target_W), mode='trilinear', align_corners=False)
+    
+    if is_qwen:
+        M_scaled = M_vol_step.view(-1, 1) 
+    else:
+        if t_dim_index == 1:
+            M_scaled = M_vol_step.permute(0, 2, 1, 3, 4) # (1, T, 1, H, W)
+        else:
+            M_scaled = M_vol_step # (1, 1, T, H, W)
+
+    return M_scaled, M_vol_step
+
+def apply_universal_mask(foreground_array, background_array, tubelets, active_tubes):
+    """
+    Universal blender.
+    Where tubelets are 'active', shows foreground_array.
+    Where tubelets are NOT 'active', shows background_array.
+    Returns a list of PIL Images ready for the VLM.
+    
+    Insertion:
+    - Active tubelets: original video, else: blurred
+    Deletion:
+    - Active tubelets: masked out, else: original video
+    """
+    mask = np.isin(tubelets, active_tubes)[..., np.newaxis]
+    masked_array = np.where(mask, foreground_array, background_array).astype(np.uint8)
+    return [Image.fromarray(f) for f in masked_array]
 
 def create_super_tubelets(video_array, tubelets, n_clusters=12, mode='spatial'):
     """
@@ -311,25 +350,3 @@ def get_data(args, row):
     eprint("\n================================")
     
     return video, qs, cur_prompt, correct_idx
-
-def rescale_mask(mask, new_H, new_W, crop_top, crop_left, target_H, target_W, target_T, T_orig, is_qwen, t_dim_index):
-    """
-    Resizes mask to input size of the VLM and returns both the formatted 
-    VLM tensor and the 5D volumetric tensor for TV norm calculation.
-    """
-    M_resized_step = F.interpolate(mask, size=(new_H, new_W), mode='bilinear', align_corners=False)
-    M_cropped_step = M_resized_step[:, :, crop_top:crop_top+target_H, crop_left:crop_left+target_W]
-    M_vol_step = M_cropped_step.permute(1, 0, 2, 3).unsqueeze(0) # (1, 1, T, H, W)
-    
-    if target_T != T_orig:
-        M_vol_step = F.interpolate(M_vol_step, size=(target_T, target_H, target_W), mode='trilinear', align_corners=False)
-    
-    if is_qwen:
-        M_scaled = M_vol_step.view(-1, 1) 
-    else:
-        if t_dim_index == 1:
-            M_scaled = M_vol_step.permute(0, 2, 1, 3, 4) # (1, T, 1, H, W)
-        else:
-            M_scaled = M_vol_step # (1, 1, T, H, W)
-
-    return M_scaled, M_vol_step

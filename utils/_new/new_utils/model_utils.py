@@ -1,3 +1,6 @@
+import gc
+
+import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 
@@ -7,7 +10,7 @@ from qwen_vl_utils import process_vision_info
 
 DEFAULT_VIDEO_TOKEN = "<video>"
 
-from logging import eprint
+from .logging import eprint
 
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
@@ -82,7 +85,7 @@ def get_token_probs(args, model, processor, full_ids, output_ids, frames):
         target_probs = target_probs.unsqueeze(0)
     return target_probs.squeeze(0) 
 
-def get_prob(args, model, processor, full_ids, output_ids, frames, positions=None):
+def get_prob(args, model, processor, full_ids, output_ids, frames, positions=None, tokenizer=None):
     """Calculates mean probability of the output_ids; optionally filtered by positions."""
     if args.model == 'qwen':
         inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896)
@@ -164,3 +167,111 @@ def get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, t
     crop_left = (new_W - target_W) // 2
     
     return dummy_inputs_orig, pixels_orig, pixels_base, target_T, target_H, target_W, t_dim_index, crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig
+
+
+def find_keywords(args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, output_text, tokenizer=None, use_yake=False, special_ids=None):
+    """
+    Finds the words that change mostly when comparing to a baseline video.
+    - baseline insertion: we are comparing to a blurred version preferably
+    """
+    if special_ids is None:
+        special_ids = []
+    seq_len = output_ids.shape[-1]
+    
+    if seq_len <= 4:
+        clean_output_ids = output_ids
+        if output_ids[0, -1] == tokenizer.eos_token_id:
+            clean_output_ids = output_ids[:, :-1] 
+            
+        positions = list(range(clean_output_ids.shape[-1]))
+        keywords = [tokenizer.decode(idx).strip() for idx in clean_output_ids[0]]
+        valid_indices = [i for i, kw in enumerate(keywords) if kw]
+        positions = [positions[i] for i in valid_indices]
+        keywords = [keywords[i] for i in valid_indices]
+        
+    else: 
+        if use_yake:
+            import yake
+            num_words = len(output_text.split())
+            keywords_num = 3 if num_words <= 10 else num_words // 4
+            kw_extractor = yake.KeywordExtractor(lan="en", n=2, dedupLim=0.2, top=keywords_num, features=None)
+            extracted = kw_extractor.extract_keywords(output_text)
+            kw_strings = [kw[0] for kw in extracted]
+            positions = []
+            keywords = []
+            for kw in kw_strings:
+                kw_ids = tokenizer.encode(kw, add_special_tokens=False)
+                matched_pos = match_keywords(output_ids[0].tolist(), kw_ids)
+                if matched_pos:
+                    positions.extend(matched_pos)
+                    keywords.extend([tokenizer.decode(output_ids[0][p]).strip() for p in matched_pos])
+        else:
+            full_prompt = torch.cat((input_ids, output_ids), dim=1)
+            probs = get_token_probs(args, model, processor, full_prompt, output_ids, frames)
+            probs_blur = get_token_probs(args, model, processor, full_prompt, output_ids, baseline_ins_frames)
+            
+            eps = 1e-7
+            probs_safe = torch.clamp(probs, min=eps)
+            probs_blur_safe = torch.clamp(probs_blur, min=eps)
+            
+            condition = (
+                (torch.log(probs_safe) - torch.log(probs_blur_safe) > 1.0) & 
+                (probs > 0.001) & 
+                (~torch.isin(output_ids[0], torch.tensor(special_ids, device=probs.device)))
+            )
+            positions = torch.where(condition)[0].tolist()
+            keywords = [tokenizer.decode(output_ids[0][idx]).strip() for idx in positions]
+            
+    return positions, keywords
+
+    
+def calculate_gradient(model, tokenizer, W_raw, pixels_interval, full_ids, 
+                        output_ids, positions, mode, args, 
+                        is_qwen, dummy_inputs_orig):
+    """
+    Calculates the gradients of each weight of the tubelets.
+    Returns the raw accumulated gradient so the main loop can calculate independent steps.
+    """
+    # Feed to model
+    forward_kwargs = {
+        "input_ids": full_ids,
+        "attention_mask": torch.ones_like(full_ids).to(model.device), 
+        "pixel_values_videos": pixels_interval.to(dtype=model.dtype),
+        "use_cache": False
+    }
+    if is_qwen:
+        forward_kwargs["video_grid_thw"] = dummy_inputs_orig["video_grid_thw"]
+    
+    outputs = model(**forward_kwargs)
+    
+    #-- Define the objective probabilities
+    logits = outputs.logits
+    out_len = output_ids.shape[-1]
+    target_logits = logits[:, -out_len - 1 : -1, :]
+    
+    predicted_ids = torch.argmax(target_logits[:, 0:1, :], dim=-1)
+    predicted_text = tokenizer.decode(predicted_ids[0], skip_special_tokens=True)
+    target_text = tokenizer.decode(output_ids[0], skip_special_tokens=True) # Assuming batch is 1
+    
+    probs = F.softmax(target_logits, dim=-1) 
+    target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+    if positions is not None and len(positions) > 0:
+        target_probs = target_probs[0, positions] 
+    mean_prob = target_probs.mean()
+    mean_prob_val = mean_prob.item()
+    log_prob = torch.log(mean_prob + 1e-7) 
+    
+    #-- Objective is dependend on the mode
+    if mode == 'deletion':
+        main_loss = log_prob / args.ig_steps 
+    else:
+        main_loss = -log_prob / args.ig_steps 
+    main_loss.backward()
+    
+    raw_accumulated_grads = W_raw.grad.detach().cpu().numpy()
+    
+    del outputs, logits, target_logits, probs, target_probs, main_loss
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    return predicted_text, target_text, raw_accumulated_grads.copy(), mean_prob_val

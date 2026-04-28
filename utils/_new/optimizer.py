@@ -1,12 +1,23 @@
+import os
+import gc
+
 import cma
-import torch
 import numpy as np
+import torch
+import torchvision
 import torch.nn.functional as F
 
-from preprocessing import rescale_mask
-from logging import eprint
-from evaluation import evaluate_fitness
-from model_utils import get_rescale_and_dummys, sigmoid
+from PIL import Image
+
+from new_utils.preprocessing import rescale_mask, create_super_tubelets, get_baseline_insertion, get_baseline_deletion
+from new_utils.logging import eprint
+from new_utils.evaluation import tv_norm_3d, evaluate_fitness, evaluate_confidence
+from new_utils.model_utils import get_rescale_and_dummys, sigmoid, calculate_gradient
+from new_utils.visualization import visualize_gradients, visualize_heatmap, debug_save_pixels_interval
+
+SAVE_INTERMEDIATE_VISUALS = False
+
+
 
 def CMA_ES(
     args, model, processor, tokenizer, full_ids, output_ids, 
@@ -128,9 +139,9 @@ def CMA_ES(
     
     return selected_tubelets, scores, metrics
 
-def spix_cmaes(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins, baseline_del, positions=None):
+def process_video(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins, baseline_del, positions=None):
     """
-    CMA-ES Optimization.
+    Wrapper around CMA-ES Optimization.
     Performs standard optimization by default, or Two-Stage Curriculum Learning 
     if `args.use_hierarchical` is set to True.
     """
@@ -519,13 +530,13 @@ def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output
             break
 
         # Main Weight Optimization Loop
-        # selected, scores, metrics = optimize_tubelet_weights(
-        #     args, model, tokenizer, processor, full_ids, output_ids, frames_current_video, frames_del_base, 
-        #     tubelets, positions, mode='deletion', stage=f"{index}-{stage}-deletion")
-        selected, scores, metrics = SimulatedAnnealing_optimization(
-            args, model, processor, tokenizer, full_ids, output_ids, 
-            frames_current_video, frames_del_base, tubelets, positions=None, mode='deletion'
-        )
+        selected, scores, metrics = optimize_tubelet_weights(
+            args, model, tokenizer, processor, full_ids, output_ids, frames_current_video, frames_del_base, 
+            tubelets, positions, mode='deletion', stage=f"{index}-{stage}-deletion")
+        # selected, scores, metrics = SimulatedAnnealing_optimization(
+        #     args, model, processor, tokenizer, full_ids, output_ids, 
+        #     frames_current_video, frames_del_base, tubelets, positions=None, mode='deletion'
+        # )
 
         eprint(f"Selected tubelets {selected}")
         if not selected:
@@ -572,13 +583,13 @@ def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output
 
         # Main Weight Optimization Loop
         # Note: frames_orig is constant (the target), frames_current_ins acts as the blurred/constant baseline
-        # selected, scores, metrics = optimize_tubelet_weights(
-        #     args, model, tokenizer, processor, full_ids, output_ids, frames_orig, frames_current_ins, 
-        #     tubelets, positions, mode='insertion', stage=f"{index}-{stage}-insertion")
-        selected, scores, metrics = SimulatedAnnealing_optimization(
-            args, model, processor, tokenizer, full_ids, output_ids, 
-            frames_orig, frames_current_ins, tubelets, positions=None, mode='insertion'
-        )
+        selected, scores, metrics = optimize_tubelet_weights(
+            args, model, tokenizer, processor, full_ids, output_ids, frames_orig, frames_current_ins, 
+            tubelets, positions, mode='insertion', stage=f"{index}-{stage}-insertion")
+        # selected, scores, metrics = SimulatedAnnealing_optimization(
+        #     args, model, processor, tokenizer, full_ids, output_ids, 
+        #     frames_orig, frames_current_ins, tubelets, positions=None, mode='insertion'
+        # )
 
         if not selected:
             eprint("No new tubelets found. Stopping insertion stages early.")

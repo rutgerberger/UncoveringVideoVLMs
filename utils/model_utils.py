@@ -214,7 +214,7 @@ def find_keywords(args, model, processor, input_ids, output_ids, frames, baselin
         else:
             full_prompt = torch.cat((input_ids, output_ids), dim=1)
             probs = get_token_probs(args, model, processor, full_prompt, output_ids, frames)
-            probs_blur = get_token_probs(args, model, processor, full_prompt, output_ids, baseline_ians_frames)
+            probs_blur = get_token_probs(args, model, processor, full_prompt, output_ids, baseline_ins_frames)
             
             eps = 1e-7
             probs_safe = torch.clamp(probs, min=eps)
