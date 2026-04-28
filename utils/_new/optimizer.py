@@ -20,14 +20,13 @@ SAVE_INTERMEDIATE_VISUALS = False
 
 
 def CMA_ES(
-    args, model, processor, tokenizer, full_ids, output_ids, 
-    frames_orig, frames_base, tubelets, positions=None, mode='deletion',
-    max_iters=None, initial_weights=None, active_tubes=None, popsize=None
+        args, model, processor, tokenizer, full_ids, output_ids, 
+        frames_orig, frames_base, tubelets, positions=None,
+        max_iters=None, initial_weights=None, active_tubes=None, popsize=None
     ):
     """
-    Performs main optimization using CMA-ES optimizers
-    - Finds ~ optimal weights according to objective (min/max confidence)
-    - Returns metrics and found weights
+    Performs Joint CMA-ES optimization (iGOS++ style)
+    - Finds optimal weights minimizing deletion and maximizing insertion simultaneously.
     """
     num_tubes = int(tubelets.max()) + 1
     tubelets_tensor = torch.tensor(tubelets, device=model.device, dtype=torch.long)
@@ -39,22 +38,11 @@ def CMA_ES(
     (dummy_inputs_orig, video, baseline, target_T, target_H, target_W, 
      t_dim_index, crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig) = packed_inputs
 
-    # Pre-calculate base and original anchors dynamically
-    W_zeros = torch.full((num_tubes,), -100.0, device=model.device) 
-    M_large_zeros = torch.sigmoid(W_zeros)[tubelets_tensor].unsqueeze(1).float()
-    M_scaled_zeros, M_vol_zeros = rescale_mask(M_large_zeros, new_H, new_W, crop_top, crop_left, target_H, target_W, target_T, T_orig, is_qwen, t_dim_index)
-    _, anchor_base = evaluate_fitness(args, mode, M_scaled_zeros, M_vol_zeros, M_large_zeros, video, baseline, model, positions, full_ids, output_ids, dummy_inputs_orig)
-
-    W_ones = torch.full((num_tubes,), 100.0, device=model.device) 
-    M_large_ones = torch.sigmoid(W_ones)[tubelets_tensor].unsqueeze(1).float()
-    M_scaled_ones, M_vol_ones = rescale_mask(M_large_ones, new_H, new_W, crop_top, crop_left, target_H, target_W, target_T, T_orig, is_qwen, t_dim_index)
-    _, anchor_orig = evaluate_fitness(args, mode, M_scaled_ones, M_vol_ones, M_large_ones, video, baseline, model, positions, full_ids, output_ids, dummy_inputs_orig)
-
+    # Initialize at W = 2.0 (Sigmoid(2.0) ~ 0.88 -> Mostly Background)
     if initial_weights is not None:
         mean_init = np.array(initial_weights, dtype=np.float64)
     else:
-        W_init = 2.0 if mode == 'deletion' else -2.0
-        mean_init = np.full(num_tubes, W_init, dtype=np.float64)
+        mean_init = np.full(num_tubes, 2.0, dtype=np.float64)
 
     sigma_0 = 1.0
     iters = max_iters if max_iters is not None else getattr(args, 'iterations', 150)
@@ -81,46 +69,43 @@ def CMA_ES(
         candidates_tensor = torch.tensor(np.stack(candidates), dtype=torch.float32, device=model.device)
         fitnesses = []
         confidences = []
+        
         for i in range(len(candidates)):
             W = candidates_tensor[i]
             M_large = torch.sigmoid(W)[tubelets_tensor].unsqueeze(1).float()
-            
             M_scaled, M_vol = rescale_mask(M_large, new_H, new_W, crop_top, crop_left, target_H, target_W, target_T, T_orig, is_qwen, t_dim_index)
             
-            fitness, confidence = evaluate_fitness(
-                args, mode, M_scaled, M_vol, M_large, video, baseline, model, 
-                positions, full_ids, output_ids, dummy_inputs_orig, 
-                anchor_base=anchor_base, anchor_orig=anchor_orig
+            fitness, score_del, score_ins = evaluate_fitness(
+                args, M_scaled, M_vol, M_large, video, baseline, model, 
+                positions, full_ids, output_ids, dummy_inputs_orig
             )
             fitnesses.append(fitness)
-            confidences.append(confidence)
+            confidences.append((score_del, score_ins))
 
         es.tell(candidates, fitnesses)
         best_idx = np.argmin(fitnesses)
         es.disp()
-        eprint(f"Gen {generation} | Best Fit: {fitnesses[best_idx]:.4f} | Conf: {confidences[best_idx]:.4f}")
+        
+        best_del, best_ins = confidences[best_idx]
+        eprint(f"Gen {generation} | Best Fit: {fitnesses[best_idx]:.4f} | Conf (Del/Ins): {best_del:.4f} / {best_ins:.4f}")
         generation += 1
     
     W_best = es.result.xbest if es.result.xbest is not None else mean_init
     W_final = sigmoid(W_best)
 
-    if mode == 'deletion':
-        scores = {t: float(1.0 - W_final[t]) for t in range(num_tubes)}
-    else:
-        scores = {t: float(W_final[t]) for t in range(num_tubes)}
+    # Invert the mask: M=0 was salient, so we do 1.0 - M to get a 0-1 saliency score
+    scores = {t: float(1.0 - W_final[t]) for t in range(num_tubes)}
 
     max_score = max(scores.values()) if scores else 0.0
-    threshold = max_score * 0.10 if max_score > 0.01 else 0.0 # Needs to be doing something at least
+    threshold = max_score * 0.10 if max_score > 0.01 else 0.0 
     selected_tubelets = [t for t, s in scores.items() if s >= threshold]
 
-    # es.D contains the square roots of the eigenvalues of the covariance matrix
     eigenvalues = es.D ** 2
     sum_eig = np.sum(eigenvalues)
     sum_sq_eig = np.sum(eigenvalues ** 2)
     d_eff = float((sum_eig ** 2) / sum_sq_eig) if sum_sq_eig > 0 else 0.0
 
     gen_best_fit = np.min(fitnesses)
-    # Apply sigmoid to the mask - we compare actual mask differences [0, 1], not unbounded logits [-5, 5]
     top_masks = [sigmoid(c) for i, c in enumerate(candidates) if fitnesses[i] <= gen_best_fit * 1.10]
     if len(top_masks) > 1:
         dists = [np.mean(np.abs(top_masks[i] - top_masks[j])) 
@@ -138,6 +123,7 @@ def CMA_ES(
     }
     
     return selected_tubelets, scores, metrics
+
 
 def process_video(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins, baseline_del, positions=None):
     """
