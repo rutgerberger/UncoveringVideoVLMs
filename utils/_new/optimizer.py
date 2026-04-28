@@ -127,7 +127,7 @@ def CMA_ES(
 
 def process_video(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins, baseline_del, positions=None):
     """
-    Wrapper around CMA-ES Optimization.
+    Wrapper around CMA-ES Optimization (iGOS++ style objective).
     Performs standard optimization by default, or Two-Stage Curriculum Learning 
     if `args.use_hierarchical` is set to True.
     """
@@ -138,15 +138,14 @@ def process_video(args, model, tokenizer, processor, input_ids, output_ids, fram
     init_pop_size = getattr(args, 'popsize', 22)
     
     # Base conversions
-    frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
     frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
     frames_orig = [Image.fromarray(np.array(img).astype(np.uint8)) for img in frames]
     
     full_ids = torch.cat((input_ids, output_ids), dim=1)
     
-    # Setup variables for the final fine-grained run
-    init_w_del, init_w_ins = None, None
-    active_tubes_del, active_tubes_ins = None, None
+    # Setup variables for the fine-grained run
+    init_w = None
+    active_tubes = None
     final_iters = total_iters # Defaults to full iterations for standard mode
     
     if use_hierarchical:
@@ -155,78 +154,61 @@ def process_video(args, model, tokenizer, processor, input_ids, output_ids, fram
         n_super = getattr(args, 'super_clusters', 12)
         cluster_mode = getattr(args, 'cluster_mode', 'spatial')
         freeze_losers = getattr(args, 'freeze_losers', False)
+        
         # Split iterations in half for the two stages
         final_iters = total_iters // 2
         
         eprint(f"Building Super-Tubelets ({n_super} clusters, mode: {cluster_mode})")
         super_tubelets, sub_to_super_map = create_super_tubelets(video_array, tubelets, n_clusters=n_super, mode=cluster_mode)
         
-        eprint(f"Coarse Optimization: Deletion")
-        _, super_scores_del, _ = CMA_ES(
+        eprint(f"Coarse Optimization: Joint Objective")
+        _, super_scores, _ = CMA_ES(
             args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_del_base, 
-            super_tubelets, positions=positions, mode='deletion', max_iters=final_iters, popsize=init_pop_size
-        )
-        
-        eprint(f"Coarse Optimization: Insertion")
-        _, super_scores_ins, _ = CMA_ES(
-            args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_ins_base, 
-            super_tubelets, positions=positions, mode='insertion', max_iters=final_iters, popsize=init_pop_size
+            super_tubelets, positions=positions, max_iters=final_iters, popsize=init_pop_size
         )
         
         # Unpack Super-Weights to Sub-Weights using Inverse Sigmoid (Logit)
         num_sub_tubes = int(tubelets.max()) + 1
-        init_w_del = np.zeros(num_sub_tubes)
-        init_w_ins = np.zeros(num_sub_tubes)
+        init_w = np.zeros(num_sub_tubes)
         
         for sub_id in range(num_sub_tubes):
             super_id = sub_to_super_map[sub_id]
-            # Deletion score is (1 - sigmoid(W)), so W = -logit(score)
-            s_del = np.clip(super_scores_del.get(super_id, 0.5), 1e-4, 1 - 1e-4)
-            init_w_del[sub_id] = -np.log(s_del / (1 - s_del))
-            # Insertion score is sigmoid(W), so W = logit(score)
-            s_ins = np.clip(super_scores_ins.get(super_id, 0.5), 1e-4, 1 - 1e-4)
-            init_w_ins[sub_id] = np.log(s_ins / (1 - s_ins))
+            # CMA_ES returns Saliency (S = 1.0 - M). Therefore M = 1.0 - S.
+            # We initialize CMA-ES with the logit of M.
+            s = np.clip(super_scores.get(super_id, 0.0), 1e-4, 1 - 1e-4)
+            m = 1.0 - s
+            init_w[sub_id] = np.log(m / (1.0 - m))
             
         # Optional: Freeze the bottom 50% performing coarse regions
         if freeze_losers:
             eprint("Freezing bottom 50% of coarse regions...")
-            med_del = np.median(list(super_scores_del.values()))
-            active_tubes_del = [sub_id for sub_id in range(num_sub_tubes) if super_scores_del[sub_to_super_map[sub_id]] >= med_del]
+            med = np.median(list(super_scores.values()))
+            active_tubes = [sub_id for sub_id in range(num_sub_tubes) if super_scores[sub_to_super_map[sub_id]] >= med]
             
-            med_ins = np.median(list(super_scores_ins.values()))
-            active_tubes_ins = [sub_id for sub_id in range(num_sub_tubes) if super_scores_ins[sub_to_super_map[sub_id]] >= med_ins]
     else:
-        eprint("\n=== Starting Standard CMA-ES ===")
+        eprint("\n=== Starting Standard CMA-ES (Joint Objective) ===")
 
     # --- Final / Standard Optimization Stage ---
     stage_name = "Stage 2: Fine-grained " if use_hierarchical else ""
-    eprint(f"{stage_name}Optimization: Deletion")
-    _, final_scores_del, deletion_metrics = CMA_ES(
+    eprint(f"{stage_name}Optimization: Joint Objective")
+    
+    selected_tubelets, final_scores, metrics = CMA_ES(
         args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_del_base, 
-        tubelets, positions=positions, mode='deletion', max_iters=final_iters, 
-        initial_weights=init_w_del, active_tubes=active_tubes_del, popsize=init_pop_size
+        tubelets, positions=positions, max_iters=final_iters, 
+        initial_weights=init_w, active_tubes=active_tubes, popsize=init_pop_size
     )
     
-    eprint(f"{stage_name}Optimization: Insertion")
-    _, final_scores_ins, insertion_metrics = CMA_ES(
-        args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_ins_base, 
-        tubelets, positions=positions, mode='insertion', max_iters=final_iters,
-        initial_weights=init_w_ins, active_tubes=active_tubes_ins, popsize=init_pop_size
-    )
-    
-    # Optional Normalization (only purpose = visualization (?) )
+    # Optional Normalization
     if getattr(args, 'normalize_weights', False):
         eprint("Normalizing weights...")
-        max_ins = max(final_scores_ins.values()) or 1.0
-        max_del = max(final_scores_del.values()) or 1.0
-        final_scores_ins = {t: s / max_ins for t, s in final_scores_ins.items()}
-        final_scores_del = {t: s / max_del for t, s in final_scores_del.items()}
+        max_score = max(final_scores.values()) or 1.0
+        final_scores = {t: s / max_score for t, s in final_scores.items()}
 
-    # Rank and Return
-    selected_ins = sorted(final_scores_ins.keys(), key=lambda t: final_scores_ins[t], reverse=True)
-    selected_del = sorted(final_scores_del.keys(), key=lambda t: final_scores_del[t], reverse=True)
+    # Rank
+    selected_ranked = sorted(final_scores.keys(), key=lambda t: final_scores[t], reverse=True)
 
-    return selected_ins, selected_del, final_scores_ins, final_scores_del, insertion_metrics, deletion_metrics
+    # Return the unified results duplicated to satisfy main.py's legacy (Ins/Del) unpacking
+    return selected_ranked, final_scores, metrics
 
 
 def optimize_tubelet_weights(

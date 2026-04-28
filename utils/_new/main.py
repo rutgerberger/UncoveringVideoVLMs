@@ -30,7 +30,6 @@ from args import init_args
 load_dotenv()
 DEFAULT_VIDEO_TOKEN = "<video>"
 
-
 def xai_method(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins_arr, baseline_del_arr, positions, ivd):
     """
     Returns the XAI method of preference (for testing)
@@ -69,17 +68,12 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         return auc_ins, auc_del, auc_ins, auc_del
 
     eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
-    selected_ins, selected_del, scores_ins, scores_del, insertion_metrics, deletion_metrics = xai_method(
+    
+    # Unpack the unified mask outputs (Assuming process_video returns 3 items now: selected, scores, metrics)
+    selected_tubes, scores, metrics = xai_method(
         args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, 
         baseline_ins_arr, baseline_del_arr, positions, ivd
     )
-    
-    # Merging mask
-    scores_merged = {}
-    unique_tubes = np.unique(tubelets)
-    for t in unique_tubes:
-        scores_merged[t] = scores_ins.get(t, 0.0) * scores_del.get(t, 0.0)
-    selected_merged = sorted(list(unique_tubes), key=lambda t: scores_merged[t], reverse=True)
 
     # Evaluation (calculating metrics, etc.)
     full_ids = torch.cat((input_ids, output_ids), dim=1)
@@ -88,10 +82,11 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions=positions, tokenizer=tokenizer)
 
     # ... for evaluation, we show what happens when deleting / inserting our mask!
-    k_fraction = 0.50
+    unique_tubes = np.unique(tubelets)
+    k_fraction = 0.25
     k_tubes = max(1, int(len(unique_tubes) * k_fraction))
 
-    top_final = selected_merged[:k_tubes]
+    top_final = selected_tubes[:k_tubes]
     frames_ins = apply_universal_mask(video_array, baseline_ins_arr, tubelets, top_final)
     prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions=positions, tokenizer=tokenizer)
     
@@ -99,22 +94,20 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     frames_del = apply_universal_mask(video_array, baseline_del_arr, tubelets, keep_tubes_del)
     prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions=positions, tokenizer=tokenizer)
 
-    top_k = min(5, len(selected_ins))
-    fmt_ins = {t: f"{scores_ins.get(t, 0):.4f}" for t in selected_ins[:top_k]}
-    fmt_del = {t: f"{scores_del.get(t, 0):.4f}" for t in selected_del[:top_k]}
-    fmt_merged = {t: f"{scores_merged.get(t, 0):.4f}" for t in selected_merged[:top_k]}
+    top_k = min(5, len(selected_tubes))
+    fmt_scores = {t: f"{scores.get(t, 0):.4f}" for t in selected_tubes[:top_k]}
  
     # Get AUC metrics
     auc_ins, auc_del = evaluate_auc(
         args, model, processor, full_ids, output_ids, frames, video_array, tubelets, 
-        selected_merged, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_merged", positions=positions
+        selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_mask", positions=positions
     )
     
     #All the data will be logged in log.txt
     log_experiment(args, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
         prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, auc_ins, auc_del,
-        deletion_metrics, insertion_metrics, top_k, fmt_ins, fmt_del, fmt_merged, 
-        selected_ins, selected_del, selected_merged, unique_tubes, k_fraction, mode_name, start
+        metrics, metrics, top_k, fmt_scores, fmt_scores, fmt_scores, 
+        selected_tubes, selected_tubes, selected_tubes, unique_tubes, k_fraction, mode_name, start
     )
 
     if getattr(args, 'save_visuals', True):
@@ -123,9 +116,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         keep_tubes_vis = [t for t in unique_tubes if t not in top_final]
         visualize_spix(video_array, baseline_del_arr, tubelets, keep_tubes_vis, os.path.join(args.output_dir, f"{ivd}_{file_prefix}mask_cutout.gif"))
         # Continuous heatmaps
-        visualize_heatmap(video_array, tubelets, scores_ins, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_ins.gif"))
-        visualize_heatmap(video_array, tubelets, scores_del, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_del.gif"))
-        visualize_heatmap(video_array, tubelets, scores_merged, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_merged.gif"))
+        visualize_heatmap(video_array, tubelets, scores, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_mask.gif"))
 
     return {
         "auc_ins": auc_ins,
@@ -225,6 +216,7 @@ def explain_data(data, model, processor, args, tokenizer):
         log_metrics(args, global_gt_metrics, prefix="GT-")
 
     eprint(f"\nExperiment Complete. Mean metrics saved to {args.output_dir}/final_metrics.json")
+
 
 if __name__ == "__main__":
     args = init_args()
