@@ -30,7 +30,6 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 eprint("Importing files 3/3...")
 from utils import *
 from method_helpers import *
-from method_helpers import _get_rescale_and_dummys
 from method import (
     spix_cmaes, 
     spix_hierarchical_cmaes,
@@ -107,9 +106,9 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
 
     # Evaluation (calculating metrics, etc.)
     full_ids = torch.cat((input_ids, output_ids), dim=1)
-    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
-    prob_baseline_del = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions)
-    prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions)
+    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions=positions, tokenizer=tokenizer)
+    prob_baseline_del = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions=positions, tokenizer=tokenizer)
+    prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions=positions, tokenizer=tokenizer)
 
     # ... for evaluation, we show what happens when deleting / inserting our mask!
     k_fraction = 0.50
@@ -117,11 +116,11 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
 
     top_final = selected_merged[:k_tubes]
     frames_ins = apply_universal_mask(video_array, baseline_ins_arr, tubelets, top_final)
-    prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
+    prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions=positions, tokenizer=tokenizer)
     
     keep_tubes_del = [t for t in unique_tubes if t not in top_final]
     frames_del = apply_universal_mask(video_array, baseline_del_arr, tubelets, keep_tubes_del)
-    prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
+    prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions=positions, tokenizer=tokenizer)
 
     top_k = min(5, len(selected_ins))
     fmt_ins = {t: f"{scores_ins.get(t, 0):.4f}" for t in selected_ins[:top_k]}

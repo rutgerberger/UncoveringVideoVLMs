@@ -38,13 +38,12 @@ def evaluate_fitness(
             target_probs = target_probs[0, positions]
         
         if torch.isnan(target_probs).any():
-            mean_prob = anchor_base if mode == 'deletion' else anchor_orig
+            score = anchor_base if mode == 'deletion' else anchor_orig
         else:
-            mean_prob = target_probs.mean().item()
+            score = torch.log(target_probs + 1e-7).sum().item()
 
     tv_penalty_raw = tv_norm_3d(M_vol)
     tv_penalty = tv_penalty_raw.item() if isinstance(tv_penalty_raw, torch.Tensor) else float(tv_penalty_raw)
-    
     """
     if mode == 'deletion': # minimize probability towards baseline
         L1_penalty = torch.mean(1.0 - M_large).item() # Penalize dropping 
@@ -56,14 +55,14 @@ def evaluate_fitness(
         fitness = diff_loss + args.reg_lambda * (L1_penalty + tv_penalty)
     """
 
-    if mode == 'deletion': # minimize probability 
+    if mode == 'deletion': # minimize log-likelihood (drive it to a large negative number)
         L1_penalty = torch.mean(1.0 - M_large).item() # Penalize dropping 
-        fitness = mean_prob + args.reg_lambda * (L1_penalty + tv_penalty)
-    else: # maximize probability 
+        fitness = score + args.reg_lambda * (L1_penalty + tv_penalty)
+    else: # maximize log-likelihood (push it closer to 0)
         L1_penalty = torch.mean(M_large).item() # Penalize revealing 
-        fitness = -mean_prob + args.reg_lambda * (L1_penalty + tv_penalty)
+        fitness = -score + args.reg_lambda * (L1_penalty + tv_penalty)
 
-    return float(fitness), mean_prob
+    return float(fitness), score
 
 
 def CMA_ES(
@@ -80,7 +79,7 @@ def CMA_ES(
     tubelets_tensor = torch.tensor(tubelets, device=model.device, dtype=torch.long)
     is_qwen = getattr(args, 'model', '') == 'qwen'
     
-    packed_inputs = _get_rescale_and_dummys(
+    packed_inputs = get_rescale_and_dummys(
         model, processor, frames_orig, frames_base, is_qwen, tubelets
     )
     (dummy_inputs_orig, video, baseline, target_T, target_H, target_W, 

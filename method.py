@@ -1,6 +1,5 @@
 from utils import *
 from method_helpers import *
-from method_helpers import _get_rescale_and_dummys, _rescale_mask
 
 from PIL import Image
 import numpy as np
@@ -14,6 +13,71 @@ import gc
 from cmaes import CMA_ES
 from ig_optimizer import optimize_tubelet_weights
 
+
+
+# def match_keywords(output_list, kw_ids):
+#     """Helper to find the sublist kw_ids within output_list and return the indices."""
+#     kw_len = len(kw_ids)
+#     for i in range(len(output_list) - kw_len + 1):
+#         if output_list[i : i + kw_len] == kw_ids:
+#             return list(range(i, i + kw_len))
+#     return []
+
+# def find_keywords(args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, output_text, tokenizer=None, use_yake=False, special_ids=None):
+#     """
+#     Finds the words that change mostly when comparing to a baseline video.
+#     - baseline insertion: we are comparing to a blurred version preferably
+#     """
+#     if special_ids is None:
+#         special_ids = []
+#     seq_len = output_ids.shape[-1]
+    
+#     if seq_len <= 4:
+#         clean_output_ids = output_ids
+#         if output_ids[0, -1] == tokenizer.eos_token_id:
+#             clean_output_ids = output_ids[:, :-1] 
+            
+#         positions = list(range(clean_output_ids.shape[-1]))
+#         keywords = [tokenizer.decode(idx).strip() for idx in clean_output_ids[0]]
+#         valid_indices = [i for i, kw in enumerate(keywords) if kw]
+#         positions = [positions[i] for i in valid_indices]
+#         keywords = [keywords[i] for i in valid_indices]
+        
+#     else: 
+#         if use_yake:
+#             import yake
+#             num_words = len(output_text.split())
+#             keywords_num = 3 if num_words <= 10 else num_words // 4
+#             kw_extractor = yake.KeywordExtractor(lan="en", n=2, dedupLim=0.2, top=keywords_num, features=None)
+#             extracted = kw_extractor.extract_keywords(output_text)
+#             kw_strings = [kw[0] for kw in extracted]
+#             positions = []
+#             keywords = []
+#             for kw in kw_strings:
+#                 kw_ids = tokenizer.encode(kw, add_special_tokens=False)
+#                 matched_pos = match_keywords(output_ids[0].tolist(), kw_ids)
+#                 if matched_pos:
+#                     positions.extend(matched_pos)
+#                     keywords.extend([tokenizer.decode(output_ids[0][p]).strip() for p in matched_pos])
+#         else:
+#             full_prompt = torch.cat((input_ids, output_ids), dim=1)
+#             probs = get_token_probs(args, model, processor, full_prompt, output_ids, frames)
+#             probs_blur = get_token_probs(args, model, processor, full_prompt, output_ids, baseline_ians_frames)
+            
+#             eps = 1e-7
+#             probs_safe = torch.clamp(probs, min=eps)
+#             probs_blur_safe = torch.clamp(probs_blur, min=eps)
+            
+#             condition = (
+#                 (torch.log(probs_safe) - torch.log(probs_blur_safe) > 1.0) & 
+#                 (probs > 0.001) & 
+#                 (~torch.isin(output_ids[0], torch.tensor(special_ids, device=probs.device)))
+#             )
+#             positions = torch.where(condition)[0].tolist()
+#             keywords = [tokenizer.decode(output_ids[0][idx]).strip() for idx in positions]
+            
+#     return positions, keywords
+    
 def spix_rise_perturbation(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, positions=None, num_masks=50, p=0.5):
     """
     Randomized Input Sampling for Explanation (RISE).
@@ -34,7 +98,7 @@ def spix_rise_perturbation(args, model, tokenizer, processor, input_ids, output_
     tubelets_tensor = torch.tensor(tubelets, device=model.device, dtype=torch.long)
 
     # -- Fast Tensor Setup
-    packed_inputs = _get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, tubelets)
+    packed_inputs = get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, tubelets)
     (dummy_inputs_orig, pixels_orig, pixels_base,
      target_T, target_H, target_W, t_dim_index,
      crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig) = packed_inputs
@@ -61,7 +125,7 @@ def spix_rise_perturbation(args, model, tokenizer, processor, input_ids, output_
         W_step_np = W_step.cpu().numpy()
         # Upscale and Format Mask to match Video Tensor
         M_high_res_step = W_step[tubelets_tensor].unsqueeze(1).float() 
-        M_low_res_step = _rescale_mask(
+        M_low_res_step = rescale_mask(
             M_high_res_step, new_H, new_W, crop_top, crop_left, 
             target_H, target_W, target_T, T_orig, is_qwen, t_dim_index
         )
