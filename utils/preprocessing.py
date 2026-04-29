@@ -82,6 +82,41 @@ def _run_slic_isolated(video_down_float, n_segments, compactness):
         enforce_connectivity=False   
     )
 
+def _run_slic_2d_isolated(video_down_float, n_segments_per_frame, compactness):
+    """
+    Runs 2D SLIC on each frame independently.
+    Offsets the labels so every patch across the entire video has a unique ID.
+    """
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    
+    T, H, W, C = video_down_float.shape
+    all_labels = []
+    current_max_label = 0
+    
+    for t in range(T):
+        frame = video_down_float[t]
+        
+        # 2D slic on a single frame
+        labels = slic(
+            frame, 
+            n_segments=n_segments_per_frame,
+            compactness=compactness, 
+            channel_axis=-1, 
+            max_num_iter=4,              
+            enforce_connectivity=False   
+        )
+        
+        # Offset labels so each frame has globally unique patch IDs
+        labels_offset = labels + current_max_label
+        all_labels.append(labels_offset)
+        
+        # Update the max label for the next frame's offset
+        current_max_label = labels_offset.max() + 1
+        
+    return np.stack(all_labels)
+
 
 def unpack_super_weights(args, tubelets, sub_to_super_map, super_scores, opt_mode):
     """
@@ -134,11 +169,16 @@ def generate_tubelets_optimized(video, args, downsample_factor=0.5):
         # Perform SLIC clustering in an isolated process (otherwise this would lead into deadlocks)
         n_seg = getattr(args, 'n_segments', 120)
         comp = getattr(args, 'compactness', 10)
+        cluster_temporal = getattr(args, 'cluster_temporal', False)
+
         with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
-            # Submit the job to the isolated process
-            future = executor.submit(_run_slic_isolated, video_down_float, n_seg, comp)
-            # This will wait for the child process to return the result
-            tubelet_labels_down = future.result() 
+            if cluster_temporal: # Standard 3D Tubelets
+                future = executor.submit(_run_slic_isolated, video_down_float, n_seg, comp)
+            else:
+                # Divide total segments by T to keep CMA-ES parameter count stable
+                n_seg = 300
+                future = executor.submit(_run_slic_2d_isolated, video_down_float, segments_per_frame, comp)
+            tubelet_labels_down = future.result()
         
         # CPU Upsampling via OpenCV
         if downsample_factor < 1.0:
