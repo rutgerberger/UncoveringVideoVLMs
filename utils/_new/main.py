@@ -59,7 +59,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
 
     eprint(f"{ivd+1}/{args.num_videos}: Selecting Keywords ({mode_name}).")
     positions, keywords = find_keywords(
-        args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, 
+        args, model, processor, input_ids, output_ids, full_ids, frames, baseline_ins_frames, 
         target_text, tokenizer=tokenizer, use_yake=args.use_yake, special_ids=special_ids
     )
 
@@ -76,11 +76,10 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     )
 
     # Evaluation (calculating metrics, etc.)
-    full_ids = torch.cat((input_ids, output_ids), dim=1)
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions=positions, tokenizer=tokenizer)
     prob_baseline_del = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions=positions, tokenizer=tokenizer)
     prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions=positions, tokenizer=tokenizer)
-
+    
     # ... for evaluation, we show what happens when deleting / inserting our mask!
     unique_tubes = np.unique(tubelets)
     k_fraction = 0.25
@@ -174,6 +173,7 @@ def explain_data(data, model, processor, args, tokenizer):
         #Get original answer of the model (with token IDs)
         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
         special_ids = [idx for idx in [tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id] if idx is not None]
+        full_ids = torch.cat((input_ids, output_ids), dim=1)
 
         #Obtain baseline videos (and save if desired)- we do it here once (saves time)
         eprint(f"{ivd+1}/{args.num_videos}: Creating Tubelets and Baseline Frames.")
@@ -187,11 +187,13 @@ def explain_data(data, model, processor, args, tokenizer):
         #     visualize_frames(baseline_ins_frames, os.path.join(args.output_dir, f"{ivd}_baseline_insertion.gif"))
         #     visualize_frames(baseline_del_frames, os.path.join(args.output_dir, f"{ivd}_baseline_deletion.gif"))
 
+        if no_prob_drop(args, model, processor, full_ids, output_ids, frames, tokenizer) continue # Is the mo
+            
         #Main pipeline
         metrics = explain_vid(
             args, model, processor, tokenizer, frames, video_array, tubelets, 
             baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, special_ids,
-            input_ids, output_ids, qs, ground_truth_label, output_text, output_text, ivd, log, 
+            input_ids, output_ids, full_ids,qs, ground_truth_label, output_text, output_text, ivd, log, 
             mode_name="STANDARD", file_prefix=""
         )
         global_metrics.append(metrics)

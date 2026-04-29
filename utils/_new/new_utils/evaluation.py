@@ -1,4 +1,5 @@
 import os
+import math
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +12,19 @@ from sklearn.metrics import auc
 from .logging import eprint
 from .model_utils import get_prob, get_score_direct
 from .preprocessing import get_baseline_deletion, get_baseline_insertion
+
+PROB_DROP_THRESHOLD = 0.30
+
+def no_prob_drop(args, model, processor, full_ids, output_ids, frames, tokenizer):
+    log_prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, tokenizer=tokenizer)
+    log_prob_baseline = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, tokenizer=tokenizer)
+    # Calculate the actual probability ratio: e^(log_baseline - log_orig)
+    prob_ratio = math.exp(log_prob_baseline - log_prob_orig)
+    prob_drop = 1.0 - prob_ratio
+    if prob_drop < PROB_DROP_THRESHOLD:
+        eprint(f"Skipping video {ivd}: Answer not dependent on video. (Prob drop: {prob_drop*100:.2f}% < {PROB_DROP_THRESHOLD*100}%)")
+        return True
+    return False 
 
 def tv_norm_3d(mask, tv_beta=2):
     """
