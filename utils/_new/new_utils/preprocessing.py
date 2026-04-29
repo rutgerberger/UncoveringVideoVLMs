@@ -16,12 +16,14 @@ import torch.nn.functional as F
 from PIL import Image
 from decord import VideoReader, cpu
 from sklearn.cluster import KMeans
+from skimage.segmentation import slic
 
 from .logging import eprint
 
 def timestamp_to_sec(timestamp):
     h, m, s = timestamp.split(':')
     return float(h) * 3600 + float(m) * 60 + float(s)
+
 
 def precompute_blurred_video(video_array, kernel_fraction=0.3, passes=3):
     """
@@ -44,6 +46,7 @@ def precompute_blurred_video(video_array, kernel_fraction=0.3, passes=3):
         blurred_video[i] = frame
     return blurred_video
 
+
 def get_baseline_insertion(args, video_array):
     """Returns the background canvas used for Insertion metrics (Blur or White)."""
     if args.insertion_mask_type == 'blur':
@@ -51,11 +54,13 @@ def get_baseline_insertion(args, video_array):
     else:
         return np.full_like(video_array, 255) # White canvas
 
+
 def get_baseline_deletion(args, video_array):
     """Returns the masking canvas used for Deletion metrics (White)."""
     #return np.zeros_like(video_array)
     return get_baseline_insertion(args, video_array) # For now just the same as insertion
     return np.full_like(video_array, 255) # Constant white video
+
 
 def _run_slic_isolated(video_down_float, n_segments, compactness):
     """
@@ -67,8 +72,6 @@ def _run_slic_isolated(video_down_float, n_segments, compactness):
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     
-    from skimage.segmentation import slic
-    
     return slic(
         video_down_float, 
         n_segments=n_segments,
@@ -78,6 +81,37 @@ def _run_slic_isolated(video_down_float, n_segments, compactness):
         max_num_iter=4,              
         enforce_connectivity=False   
     )
+
+
+def unpack_super_weights(args, tubelets, sub_to_super_map, super_scores, opt_mode):
+    """
+    Unpacks saliency scores from coarse Super-Tubelets into initial logit weights
+    for fine-grained Sub-Tubelets, applying the correct inverse sigmoid (logit) 
+    conversion based on the optimization mode.
+    """
+    num_sub_tubes = int(tubelets.max()) + 1
+    init_w = np.zeros(num_sub_tubes)
+    for sub_id in range(num_sub_tubes):
+        super_id = sub_to_super_map[sub_id]
+        # Get saliency score (S), defaulting to 0.5, strictly bounded to prevent log(0)
+        s = np.clip(super_scores.get(super_id, 0.5), 1e-4, 1.0 - 1e-4)
+        # Convert Saliency back to unbounded CMA-ES weights (Logit function)
+        if opt_mode == 'insertion':
+            # For insertion: Weight directly maps to Saliency
+            w_val = np.log(s / (1.0 - s))
+        else: 
+            # For deletion/joint: Weight maps to Mask (M), where Saliency = 1.0 - M
+            m = 1.0 - s
+            w_val = np.log(m / (1.0 - m))
+        # Clip to [-4.9, 4.9] to prevent extreme/saturated initializations
+        init_w[sub_id] = np.clip(w_val, -4.9, 4.9)
+    
+    active_tubes = None
+    if getattr(args, 'freeze_losers', False):
+        med = np.median(list(super_scores.values()))
+        active_tubes = [sub_id for sub_id in range(num_sub_tubes) if super_scores[sub_to_super_map[sub_id]] >= med]
+
+    return init_w, active_tubes
 
 def generate_tubelets_optimized(video, args, downsample_factor=0.5):
     video_array = np.stack([np.array(img) for img in video]) 

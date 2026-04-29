@@ -30,14 +30,14 @@ from args import init_args
 load_dotenv()
 DEFAULT_VIDEO_TOKEN = "<video>"
 
-def xai_method(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins_arr, baseline_del_arr, positions, ivd):
+def xai_method(args, model, tokenizer, processor, input_ids, output_ids, full_ids, frames, tubelets, baseline_ins_arr, baseline_del_arr, positions, ivd):
     """
     Returns the XAI method of preference (for testing)
     """
     method = getattr(args, 'method', 'cmaes')
     if method == 'cmaes':
         return process_video(
-            args, model, tokenizer, processor, input_ids, output_ids, 
+            args, model, tokenizer, processor, output_ids, full_ids
             frames, tubelets, baseline_ins_arr, baseline_del_arr, positions=positions
         )
     else:
@@ -71,7 +71,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     
     # Unpack the unified mask outputs (Assuming process_video returns 3 items now: selected, scores, metrics)
     selected_tubes, scores, metrics = xai_method(
-        args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, 
+        args, model, tokenizer, processor, input_ids, output_ids, full_ids, frames, tubelets, 
         baseline_ins_arr, baseline_del_arr, positions, ivd
     )
 

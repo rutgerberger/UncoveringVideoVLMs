@@ -21,42 +21,46 @@ SAVE_INTERMEDIATE_VISUALS = False
 
 def CMA_ES(
         args, model, processor, tokenizer, full_ids, output_ids, 
-        frames_orig, frames_base, tubelets, positions=None,
+        frames_orig, frames_base, tubelets, positions=None, mode='joint',
         max_iters=None, initial_weights=None, active_tubes=None, popsize=None
     ):
     """
-    Performs Joint CMA-ES optimization (iGOS++ style)
-    - Finds optimal weights minimizing deletion and maximizing insertion simultaneously.
+    Performs Universal CMA-ES optimization
+    - mode='joint': Minimizes deletion and maximizes insertion simultaneously.
+    - mode='deletion': Only minimizes deletion log-likelihood.
+    - mode='insertion': Only maximizes insertion log-likelihood.
     """
+    
+    sigma_0 = 2.0 #HP
+    iters = max_iters if max_iters is not None else getattr(args, 'iterations', 150)
+    es_popsize = popsize if popsize is not None else getattr(args, 'popsize', 20)
+
     num_tubes = int(tubelets.max()) + 1
     tubelets_tensor = torch.tensor(tubelets, device=model.device, dtype=torch.long)
     is_qwen = getattr(args, 'model', '') == 'qwen'
     
+    #We need these attributes to directly feed the model (without slow HF preprocessor)
     packed_inputs = get_rescale_and_dummys(
         model, processor, frames_orig, frames_base, is_qwen, tubelets
     )
     (dummy_inputs_orig, video, baseline, target_T, target_H, target_W, 
      t_dim_index, crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig) = packed_inputs
 
-    # Initialize at W = 2.0 (Sigmoid(2.0) ~ 0.88 -> Mostly Background)
+    # Init depending on mode
     if initial_weights is not None:
         mean_init = np.array(initial_weights, dtype=np.float64)
     else:
-        mean_init = np.full(num_tubes, 2.0, dtype=np.float64)
-
-    sigma_0 = 1.0
-    iters = max_iters if max_iters is not None else getattr(args, 'iterations', 150)
-    es_popsize = popsize if popsize is not None else getattr(args, 'popsize', 20)
+        w_init = -2.0 if mode == 'insertion' else 2.0
+        mean_init = np.full(num_tubes, w_init, dtype=np.float64)
 
     es = cma.CMAEvolutionStrategy(mean_init, sigma_0, {
-        'maxiter': iters, 
-        'popsize': es_popsize,
-        'bounds': [-5.0, 5.0]
+        'maxiter': iters, 'popsize': es_popsize, 'bounds': [-5.0, 5.0]
     })
 
     generation = 0
     active_set = set(active_tubes) if active_tubes is not None else None
 
+    #ES loop
     while not es.stop():
         candidates = es.ask()
         
@@ -67,22 +71,23 @@ def CMA_ES(
                         c[t] = mean_init[t]
 
         candidates_tensor = torch.tensor(np.stack(candidates), dtype=torch.float32, device=model.device)
-        fitnesses = []
-        confidences = []
+        fitnesses, confidences = [], []
         
-        for i in range(len(candidates)):
-            W = candidates_tensor[i]
-            M_large = torch.sigmoid(W)[tubelets_tensor].unsqueeze(1).float()
+        for i in range(len(candidates)): #Evaluation
+            W = candidates_tensor[i] # Map weights to tubelets
+            M_large = torch.sigmoid(W)[tubelets_tensor].unsqueeze(1).float() # Raw weights to [0,1]
+            #Rescale the mask to target dimension of the VLM
             M_scaled, M_vol = rescale_mask(M_large, new_H, new_W, crop_top, crop_left, target_H, target_W, target_T, T_orig, is_qwen, t_dim_index)
             
+            #Use these to evaluate the fitness
             fitness, score_del, score_ins = evaluate_fitness(
-                args, M_scaled, M_vol, M_large, video, baseline, model, 
+                args, mode, M_scaled, M_vol, M_large, video, baseline, model, 
                 positions, full_ids, output_ids, dummy_inputs_orig
             )
             fitnesses.append(fitness)
             confidences.append((score_del, score_ins))
 
-        es.tell(candidates, fitnesses)
+        es.tell(candidates, fitnesses) #Update
         best_idx = np.argmin(fitnesses)
         es.disp()
         
@@ -93,12 +98,11 @@ def CMA_ES(
     W_best = es.result.xbest if es.result.xbest is not None else mean_init
     W_final = sigmoid(W_best)
 
-    # Invert the mask: M=0 was salient, so we do 1.0 - M to get a 0-1 saliency score
-    scores = {t: float(1.0 - W_final[t]) for t in range(num_tubes)}
-
-    max_score = max(scores.values()) if scores else 0.0
-    threshold = max_score * 0.10 if max_score > 0.01 else 0.0 
-    selected_tubelets = [t for t, s in scores.items() if s >= threshold]
+    # Invert mask for Deletion and Joint to get Saliency (0-1). For insertion, W is already saliency.
+    if mode == 'insertion':
+        scores = {t: float(W_final[t]) for t in range(num_tubes)}
+    else:
+        scores = {t: float(1.0 - W_final[t]) for t in range(num_tubes)}
 
     eigenvalues = es.D ** 2
     sum_eig = np.sum(eigenvalues)
@@ -122,96 +126,73 @@ def CMA_ES(
         "num_top_candidates": len(top_masks)
     }
     
-    return selected_tubelets, scores, metrics
+    return scores, metrics
 
 
-def process_video(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins, baseline_del, positions=None):
-    """
-    Wrapper around CMA-ES Optimization (iGOS++ style objective).
-    Performs standard optimization by default, or Two-Stage Curriculum Learning 
-    if `args.use_hierarchical` is set to True.
-    """
+def process_video(args, model, tokenizer, processor, output_ids, full_ids, frames, tubelets, baseline_ins, baseline_del, positions=None):
+    # Expects args.mask_mode = 'joint', 'separate', 'deletion', or 'insertion'
+    mask_mode = getattr(args, 'mask_mode', 'joint') 
     
-    # Configuration
-    use_hierarchical = getattr(args, 'use_hierarchical', False)
-    total_iters = getattr(args, 'iterations', 100)
-    init_pop_size = getattr(args, 'popsize', 22)
-    
-    # Base conversions
-    frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
     frames_orig = [Image.fromarray(np.array(img).astype(np.uint8)) for img in frames]
+    frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
+    frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
     
-    full_ids = torch.cat((input_ids, output_ids), dim=1)
-    
-    # Setup variables for the fine-grained run
-    init_w = None
-    active_tubes = None
-    final_iters = total_iters # Defaults to full iterations for standard mode
-    
-    if use_hierarchical:
-        eprint("\n=== Starting Hierarchical CMA-ES (Stage 1: Coarse) ===")
+    # Internal helper to handle Hierarchical vs Standard seamlessly for both objectives (joint vs separate)
+    def run_cmaes_for_mode(opt_mode, base_frames):
+        use_hierarchical = getattr(args, 'use_hierarchical', False)
+        total_iters = getattr(args, 'iterations', 100)
+        popsize = getattr(args, 'popsize', 22)
+        
+        if not use_hierarchical: #Just a single loop of CMA-ES
+            eprint(f"\n=== Standard CMA-ES ({opt_mode.upper()}) ===")
+            return CMA_ES(
+                args, model, processor, tokenizer, full_ids, output_ids, frames_orig, base_frames, 
+                tubelets, positions=positions, mode=opt_mode, max_iters=total_iters, popsize=popsize
+            )
+
+        eprint(f"\n=== Hierarchical Stage 1: Coarse ({opt_mode.upper()}) ===")
         video_array = np.stack([np.array(img) for img in frames])
         n_super = getattr(args, 'super_clusters', 12)
         cluster_mode = getattr(args, 'cluster_mode', 'spatial')
-        freeze_losers = getattr(args, 'freeze_losers', False)
+        super_tubelets, sub_to_super = create_super_tubelets(video_array, tubelets, n_clusters=n_super, mode=cluster_mode)
         
-        # Split iterations in half for the two stages
-        final_iters = total_iters // 2
-        
-        eprint(f"Building Super-Tubelets ({n_super} clusters, mode: {cluster_mode})")
-        super_tubelets, sub_to_super_map = create_super_tubelets(video_array, tubelets, n_clusters=n_super, mode=cluster_mode)
-        
-        eprint(f"Coarse Optimization: Joint Objective")
-        _, super_scores, _ = CMA_ES(
-            args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_del_base, 
-            super_tubelets, positions=positions, max_iters=final_iters, popsize=init_pop_size
+        #First part over super clusters
+        super_scores, _ = CMA_ES(
+            args, model, processor, tokenizer, full_ids, output_ids, frames_orig, base_frames, 
+            super_tubelets, positions=positions, mode=opt_mode, max_iters=total_iters // 2, popsize=popsize
         )
         
-        # Unpack Super-Weights to Sub-Weights using Inverse Sigmoid (Logit)
-        num_sub_tubes = int(tubelets.max()) + 1
-        init_w = np.zeros(num_sub_tubes)
+        #Boil down to smaller clusters
+        init_w, active_tubes = unpack_super_weights(args, tubelets, sub_to_super, super_scores, opt_mode)
+            
+        eprint(f"\n=== Hierarchical Stage 2: Fine ({opt_mode.upper()}) ===")
+        return CMA_ES(
+            args, model, processor, tokenizer, full_ids, output_ids, frames_orig, base_frames, 
+            tubelets, positions=positions, mode=opt_mode, max_iters=total_iters // 2, 
+            initial_weights=init_w, active_tubes=active_tubes, popsize=popsize
+        )
+
+    if mask_mode == 'separate':
+        scores_del, metrics_del = run_cmaes_for_mode('deletion', frames_del_base)
+        scores_ins, metrics_ins = run_cmaes_for_mode('insertion', frames_ins_base)
+        # Hadamard Product merge
+        merged_scores = {t: scores_del[t] * scores_ins.get(t, 0.0) for t in scores_del}
+        if getattr(args, 'normalize_weights', False):
+            max_val = max(merged_scores.values()) or 1.0
+            merged_scores = {t: s / max_val for t, s in merged_scores.items()}
+        ranked_tubelets = sorted(merged_scores.keys(), key=lambda t: merged_scores[t], reverse=True)
+        return ranked_tubelets, merged_scores, {"del": metrics_del, "ins": metrics_ins}
         
-        for sub_id in range(num_sub_tubes):
-            super_id = sub_to_super_map[sub_id]
-            # CMA_ES returns Saliency (S = 1.0 - M). Therefore M = 1.0 - S.
-            # We initialize CMA-ES with the logit of M.
-            s = np.clip(super_scores.get(super_id, 0.0), 1e-4, 1 - 1e-4)
-            m = 1.0 - s
-            w_val = np.log(m / (1.0 - m))
-            init_w[sub_id] = np.clip(w_val, -4.9, 4.9)
-            # init_w[sub_id] = np.log(m / (1.0 - m))
+    else: # 'joint', 'deletion', 'insertion'
+        base = frames_ins_base if mask_mode == 'insertion' else frames_del_base
+        scores, metrics = run_cmaes_for_mode(mask_mode, base)
+        
+        if getattr(args, 'normalize_weights', False):
+            max_val = max(scores.values()) or 1.0
+            scores = {t: s / max_val for t, s in scores.items()}
             
-        # Optional: Freeze the bottom 50% performing coarse regions
-        if freeze_losers:
-            eprint("Freezing bottom 50% of coarse regions...")
-            med = np.median(list(super_scores.values()))
-            active_tubes = [sub_id for sub_id in range(num_sub_tubes) if super_scores[sub_to_super_map[sub_id]] >= med]
-            
-    else:
-        eprint("\n=== Starting Standard CMA-ES (Joint Objective) ===")
-
-    # --- Final / Standard Optimization Stage ---
-    stage_name = "Stage 2: Fine-grained " if use_hierarchical else ""
-    eprint(f"{stage_name}Optimization: Joint Objective")
-    
-    selected_tubelets, final_scores, metrics = CMA_ES(
-        args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_del_base, 
-        tubelets, positions=positions, max_iters=final_iters, 
-        initial_weights=init_w, active_tubes=active_tubes, popsize=init_pop_size
-    )
-    
-    # Optional Normalization
-    if getattr(args, 'normalize_weights', False):
-        eprint("Normalizing weights...")
-        max_score = max(final_scores.values()) or 1.0
-        final_scores = {t: s / max_score for t, s in final_scores.items()}
-
-    # Rank
-    selected_ranked = sorted(final_scores.keys(), key=lambda t: final_scores[t], reverse=True)
-
-    # Return the unified results duplicated to satisfy main.py's legacy (Ins/Del) unpacking
-    return selected_ranked, final_scores, metrics
-
+        ranked_tubelets = sorted(scores.keys(), key=lambda t: scores[t], reverse=True)
+        return ranked_tubelets, scores, metrics
 
 def optimize_tubelet_weights(
         args, model, tokenizer, processor, full_ids, output_ids, frames, baseline_frames, 
@@ -586,3 +567,90 @@ def spix_gradient_iterative(args, model, tokenizer, processor, input_ids, output
         stage += 1
 
     return list(accumulated_ins), list(accumulated_del), final_scores_ins, final_scores_del, insertion_metrics, deletion_metrics 
+
+
+def __process_video(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins, baseline_del, positions=None):
+    """
+    Wrapper around CMA-ES Optimization (iGOS++ style objective).
+    Performs standard optimization by default, or Two-Stage Curriculum Learning 
+    if `args.use_hierarchical` is set to True.
+    """
+    
+    # Configuration
+    use_hierarchical = getattr(args, 'use_hierarchical', False)
+    total_iters = getattr(args, 'iterations', 100)
+    init_pop_size = getattr(args, 'popsize', 22)
+    
+    # Base conversions
+    frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
+    frames_orig = [Image.fromarray(np.array(img).astype(np.uint8)) for img in frames]
+    
+    full_ids = torch.cat((input_ids, output_ids), dim=1)
+    
+    # Setup variables for the fine-grained run
+    init_w = None
+    active_tubes = None
+    final_iters = total_iters # Defaults to full iterations for standard mode
+    
+    if use_hierarchical:
+        eprint("\n=== Starting Hierarchical CMA-ES (Stage 1: Coarse) ===")
+        video_array = np.stack([np.array(img) for img in frames])
+        n_super = getattr(args, 'super_clusters', 12)
+        cluster_mode = getattr(args, 'cluster_mode', 'spatial')
+        freeze_losers = getattr(args, 'freeze_losers', False)
+        
+        # Split iterations in half for the two stages
+        final_iters = total_iters // 2
+        
+        eprint(f"Building Super-Tubelets ({n_super} clusters, mode: {cluster_mode})")
+        super_tubelets, sub_to_super_map = create_super_tubelets(video_array, tubelets, n_clusters=n_super, mode=cluster_mode)
+        
+        eprint(f"Coarse Optimization: Joint Objective")
+        _, super_scores, _ = CMA_ES(
+            args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_del_base, 
+            super_tubelets, positions=positions, max_iters=final_iters, popsize=init_pop_size
+        )
+        
+        # Unpack Super-Weights to Sub-Weights using Inverse Sigmoid (Logit)
+        num_sub_tubes = int(tubelets.max()) + 1
+        init_w = np.zeros(num_sub_tubes)
+        
+        for sub_id in range(num_sub_tubes):
+            super_id = sub_to_super_map[sub_id]
+            # CMA_ES returns Saliency (S = 1.0 - M). Therefore M = 1.0 - S.
+            # We initialize CMA-ES with the logit of M.
+            s = np.clip(super_scores.get(super_id, 0.0), 1e-4, 1 - 1e-4)
+            m = 1.0 - s
+            w_val = np.log(m / (1.0 - m))
+            init_w[sub_id] = np.clip(w_val, -4.9, 4.9)
+            # init_w[sub_id] = np.log(m / (1.0 - m))
+            
+        # Optional: Freeze the bottom 50% performing coarse regions
+        if freeze_losers:
+            eprint("Freezing bottom 50% of coarse regions...")
+            med = np.median(list(super_scores.values()))
+            active_tubes = [sub_id for sub_id in range(num_sub_tubes) if super_scores[sub_to_super_map[sub_id]] >= med]
+            
+    else:
+        eprint("\n=== Starting Standard CMA-ES (Joint Objective) ===")
+
+    # --- Final / Standard Optimization Stage ---
+    stage_name = "Stage 2: Fine-grained " if use_hierarchical else ""
+    eprint(f"{stage_name}Optimization: Joint Objective")
+    
+    selected_tubelets, final_scores, metrics = CMA_ES(
+        args, model, processor, tokenizer, full_ids, output_ids, frames_orig, frames_del_base, 
+        tubelets, positions=positions, max_iters=final_iters, 
+        initial_weights=init_w, active_tubes=active_tubes, popsize=init_pop_size
+    )
+    
+    # Optional Normalization
+    if getattr(args, 'normalize_weights', False):
+        eprint("Normalizing weights...")
+        max_score = max(final_scores.values()) or 1.0
+        final_scores = {t: s / max_score for t, s in final_scores.items()}
+
+    # Rank
+    selected_ranked = sorted(final_scores.keys(), key=lambda t: final_scores[t], reverse=True)
+
+    return selected_ranked, final_scores, metrics

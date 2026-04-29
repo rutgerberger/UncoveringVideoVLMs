@@ -40,26 +40,47 @@ def tv_norm_3d(mask, tv_beta=2):
 
 
 def evaluate_fitness(
-    args, M_scaled, M_vol, M_large, video, baseline, model, positions, full_ids, output_ids, dummy_inputs_orig,
-    current_l2_weight=0.0
-    ):
-    
-    video_del = video * M_scaled + baseline * (1.0 - M_scaled)
-    video_ins = baseline * M_scaled + video * (1.0 - M_scaled) 
+    args, mode, M_scaled, M_vol, M_large, video, baseline, model, positions, full_ids, output_ids, dummy_inputs_orig
+):
+    # M_scaled is the ratio of original video to keep.
+    # For both deletion and insertion, this is exactly the same base formula.
+    video_blended = video * M_scaled + baseline * (1.0 - M_scaled)
 
     with torch.no_grad():
-        score_del = get_score_direct(video_del, model, args, full_ids, output_ids, dummy_inputs_orig, positions)
-        score_ins = get_score_direct(video_ins, model, args, full_ids, output_ids, dummy_inputs_orig, positions)
+        score = get_score_direct(video_blended, model, args, full_ids, output_ids, dummy_inputs_orig, positions)
+
+    # For joint optimization, we also need to test the exact inverse mask 
+    if mode == 'joint':
+        video_inverse = baseline * M_scaled + video * (1.0 - M_scaled)
+        with torch.no_grad():
+            score_inv = get_score_direct(video_inverse, model, args, full_ids, output_ids, dummy_inputs_orig, positions)
+        score_del, score_ins = score, score_inv
+    else:
+        score_del = score if mode == 'deletion' else 0.0
+        score_ins = score if mode == 'insertion' else 0.0
 
     tv_penalty_raw = tv_norm_3d(M_vol)
     tv_penalty = tv_penalty_raw.item() if isinstance(tv_penalty_raw, torch.Tensor) else float(tv_penalty_raw)
-    L1_penalty = torch.mean(torch.abs(1.0 - M_large)).item() 
-    #L2_penalty = torch.mean((1.0 - M_large)**2).item() 
-
-    # Minimize deletion score, maximize insertion score (so minus score_ins)
-    fitness = score_del - score_ins + args.reg_lambda * (L1_penalty + tv_penalty)# + (current_l2_weight * L2_penalty)
+    
+    # Optimization Objectives:
+    if mode == 'deletion':
+        # Push M towards 0 (drop pixels) while minimizing the log-likelihood
+        L1_penalty = torch.mean(torch.abs(1.0 - M_large)).item() 
+        fitness = score_del + args.reg_lambda * (L1_penalty + tv_penalty)
+        
+    elif mode == 'insertion':
+        # Push M towards 0 (hide pixels) while MAXIMIZING the log-likelihood (minimizing -score)
+        L1_penalty = torch.mean(torch.abs(M_large)).item() 
+        fitness = -score_ins + args.reg_lambda * (L1_penalty + tv_penalty)
+        
+    else: # mode == 'joint'
+        # Push M towards 0 while minimizing score_del and maximizing score_ins
+        L1_penalty = torch.mean(torch.abs(1.0 - M_large)).item() 
+        fitness = score_del - score_ins + args.reg_lambda * (L1_penalty + tv_penalty)
 
     return float(fitness), score_del, score_ins
+
+
 
 def evaluate_confidence(model, processor, frames, input_ids, output_ids, is_qwen):
     """
