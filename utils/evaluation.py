@@ -23,6 +23,7 @@ def get_prob_drop(args, model, processor, full_ids, output_ids, frames, tokenize
     prob_drop = 1.0 - prob_ratio
     return prob_drop
 
+
 def tv_norm_3d(mask, tv_beta=2):
     """
     Calculates the Total Variation loss for a 3D video mask.

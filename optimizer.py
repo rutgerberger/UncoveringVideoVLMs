@@ -9,11 +9,11 @@ import torch.nn.functional as F
 
 from PIL import Image
 
-from new_utils.preprocessing import rescale_mask, create_super_tubelets, get_baseline_insertion, get_baseline_deletion
-from new_utils.logging import eprint
-from new_utils.evaluation import tv_norm_3d, evaluate_fitness, evaluate_confidence
-from new_utils.model_utils import get_rescale_and_dummys, sigmoid, calculate_gradient
-from new_utils.visualization import visualize_gradients, visualize_heatmap, debug_save_pixels_interval
+from utils.preprocessing import rescale_mask, create_super_tubelets, get_baseline_insertion, get_baseline_deletion
+from utils.logging import eprint
+from utils.evaluation import tv_norm_3d, evaluate_fitness, evaluate_confidence
+from utils.model_utils import get_rescale_and_dummys, sigmoid, calculate_gradient
+from utils.visualization import visualize_gradients, visualize_heatmap, debug_save_pixels_interval
 
 SAVE_INTERMEDIATE_VISUALS = False
 

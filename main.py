@@ -1,4 +1,4 @@
-from new_utils.logging import eprint
+from utils.logging import eprint
 
 eprint("Loading libraries 1/3...")
 import os
@@ -23,8 +23,9 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 eprint("Importing files 3/3...")
 
-from new_utils import *
+from utils import *
 from optimizer import process_video, spix_gradient_iterative
+from IGOS.igos_framewise import video_iGOS_pp
 from args import init_args
 
 load_dotenv()
@@ -64,8 +65,21 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     )
 
     if getattr(args, 'method', '') == 'igos':
-        auc_ins, auc_del = perform_igos()
-        return auc_ins, auc_del, auc_ins, auc_del
+        auc_ins, auc_del = run_igos(
+            args=args, 
+            model=model, 
+            processor=processor, 
+            full_ids=full_ids, 
+            output_ids=output_ids, 
+            frames=frames, 
+            baseline_frames=baseline_ins_frames, 
+            positions=positions, 
+            ivd=ivd
+        )
+        return {
+            "auc_ins": auc_ins,
+            "auc_del": auc_del
+        }
 
     eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
     
