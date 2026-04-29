@@ -177,7 +177,9 @@ def process_video(args, model, tokenizer, processor, input_ids, output_ids, fram
             # We initialize CMA-ES with the logit of M.
             s = np.clip(super_scores.get(super_id, 0.0), 1e-4, 1 - 1e-4)
             m = 1.0 - s
-            init_w[sub_id] = np.log(m / (1.0 - m))
+            w_val = np.log(m / (1.0 - m))
+            init_w[sub_id] = np.clip(w_val, -4.9, 4.9)
+            # init_w[sub_id] = np.log(m / (1.0 - m))
             
         # Optional: Freeze the bottom 50% performing coarse regions
         if freeze_losers:

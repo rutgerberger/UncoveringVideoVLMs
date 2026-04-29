@@ -15,23 +15,49 @@ from .logging import eprint
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
     
-def generate_qwen(args, model, processor, prompt: str, frames):
+def process_vid_qwen(processor, frames, prompt=" ", apply_chat_template=False, fps=1.0, max_pixels=112896):
+    """
+    Universal wrapper for Qwen's vision processor to prevent feature/token mismatches.
+    """
     messages = [
         {"role": "user", "content": [
-            {"type": "video", "video": frames, "fps": 1.0},
+            {"type": "video", "video": frames, "fps": fps},
             {"type": "text", "text": prompt},
         ]},
     ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt", max_pixels=112896)
+    
+    # Only format with the <|im_start|> tags if we are explicitly asking for an answer
+    if apply_chat_template:
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text_inputs = [text]
+    else:
+        text_inputs = [prompt]
+        
+    inputs = processor(
+        text=text_inputs, 
+        images=image_inputs, 
+        videos=video_inputs, 
+        padding=True, 
+        return_tensors="pt", 
+        max_pixels=max_pixels
+    )
+    
+    return inputs    
+
+def generate_qwen(args, model, processor, prompt: str, frames):
+    inputs = process_vid_qwen(processor, frames, prompt=prompt, apply_chat_template=True)
     inputs = inputs.to(model.device)
+    
     with torch.no_grad():
         generated_ids = model.generate(**inputs, max_new_tokens=getattr(args, 'max_new_tokens', 128))
+        
     input_length = inputs.input_ids.shape[1]
     output_ids = generated_ids[:, input_length:]
     output_text = processor.batch_decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    
     return inputs.input_ids, output_ids, output_text[0]
+
 
 def generate(args, model, tokenizer, inputs):
     input_ids = inputs['input_ids'].to(model.device)
@@ -53,44 +79,15 @@ def get_model_response(args, model, processor, tokenizer, prompt, frames):
         inputs = processor(text=prompt, videos=frames, return_tensors='pt')
         return generate(args, model, tokenizer, inputs)
 
-def get_token_probs(args, model, processor, full_ids, output_ids, frames):
-    if args.model == 'qwen':
-        inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896)
-    else:
-        inputs = processor(text=" ", videos=frames, return_tensors="pt")
-        
-    pixel_values = inputs['pixel_values_videos'].to(model.device, dtype=model.dtype)
-    if pixel_values.dim() == 4:
-        pixel_values = pixel_values.unsqueeze(0)
-        
-    forward_kwargs = {
-        "input_ids": full_ids,
-        "attention_mask": torch.ones_like(full_ids).to(model.device),
-        "pixel_values_videos": pixel_values,
-        "use_cache": True
-    }
-    if 'video_grid_thw' in inputs:
-        forward_kwargs['video_grid_thw'] = inputs['video_grid_thw'].to(model.device)
-        
-    with torch.no_grad():
-        outputs = model(**forward_kwargs)
-        
-    logits = outputs.logits 
-    out_len = output_ids.shape[-1]
-    target_logits = logits[:, -out_len - 1 : -1, :] 
-    probs = F.softmax(target_logits, dim=-1) 
-    target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-    
-    if target_probs.dim() == 0:
-        target_probs = target_probs.unsqueeze(0)
-    return target_probs.squeeze(0) 
 
 def get_prob(args, model, processor, full_ids, output_ids, frames, positions=None, tokenizer=None):
-    """Calculates mean probability of the output_ids; optionally filtered by positions."""
+    """Calculates log probability of the output_ids; optionally filtered by positions."""
+
     if args.model == 'qwen':
-        inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896)
+        inputs = process_vid_qwen(processor, frames)
     else:
         inputs = processor(text=" ", videos=frames, return_tensors="pt")
+    
     pixel_values = inputs['pixel_values_videos'].to(model.device, dtype=model.dtype)
     if pixel_values.dim() == 4:
         pixel_values = pixel_values.unsqueeze(0)
@@ -166,16 +163,16 @@ def get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, t
     """
     with torch.no_grad():
         if is_qwen:
-            dummy_inputs_orig = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896).to(model.device)
-            dummy_inputs_base = processor(text=[" "], videos=[baseline_frames], padding=True, return_tensors="pt", max_pixels=112896).to(model.device)
+            dummy_inputs_orig = process_vid_qwen(processor, frames).to(model.device)
+            dummy_inputs_base = process_vid_qwen(processor, baseline_frames).to(model.device)
+
             pixels_orig = dummy_inputs_orig['pixel_values_videos'].detach()
             pixels_base = dummy_inputs_base['pixel_values_videos'].detach()
             
             grid_thw = dummy_inputs_orig['video_grid_thw'][0] 
             target_T, target_H, target_W = grid_thw[0].item(), grid_thw[1].item(), grid_thw[2].item()
-            # Qwen's tensor is strictly 2D: (total_patches, patch_features)
             target_C = pixels_orig.shape[1] 
-            t_dim_index = -1 # Placeholder, standard 5D indexing does not apply
+            t_dim_index = -1
         else:
             dummy_inputs_orig = processor(text=" ", videos=frames, return_tensors="pt").to(model.device)
             dummy_inputs_base = processor(text=" ", videos=baseline_frames, return_tensors="pt").to(model.device)
@@ -189,6 +186,7 @@ def get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, t
             else:
                 target_T, target_C, target_H, target_W = target_tensor_shape[1:5]
                 t_dim_index = 1
+
                 
     # Cropping: Precalculate exact HF geometry scaling
     T_orig, H_orig, W_orig = tubelets.shape
@@ -198,6 +196,42 @@ def get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, t
     crop_left = (new_W - target_W) // 2
     
     return dummy_inputs_orig, pixels_orig, pixels_base, target_T, target_H, target_W, t_dim_index, crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig
+
+
+
+def get_token_probs(args, model, processor, full_ids, output_ids, frames):
+    """
+    Returns token probabilities of specified IDs (helper for find keywords)
+    """
+    if args.model == 'qwen':
+        inputs = process_vid_qwen(processor, frames)
+    else:
+        inputs = processor(text=" ", videos=frames, return_tensors="pt")        
+    pixel_values = inputs['pixel_values_videos'].to(model.device, dtype=model.dtype)
+    if pixel_values.dim() == 4:
+        pixel_values = pixel_values.unsqueeze(0)
+        
+    forward_kwargs = {
+        "input_ids": full_ids,
+        "attention_mask": torch.ones_like(full_ids).to(model.device),
+        "pixel_values_videos": pixel_values,
+        "use_cache": True
+    }
+    if 'video_grid_thw' in inputs:
+        forward_kwargs['video_grid_thw'] = inputs['video_grid_thw'].to(model.device)
+        
+    with torch.no_grad():
+        outputs = model(**forward_kwargs)
+        
+    logits = outputs.logits 
+    out_len = output_ids.shape[-1]
+    target_logits = logits[:, -out_len - 1 : -1, :] 
+    probs = F.softmax(target_logits, dim=-1) 
+    target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+    
+    if target_probs.dim() == 0:
+        target_probs = target_probs.unsqueeze(0)
+    return target_probs.squeeze(0) 
 
 
 def find_keywords(args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, output_text, tokenizer=None, use_yake=False, special_ids=None):

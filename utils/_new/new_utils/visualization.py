@@ -43,7 +43,7 @@ def debug_save_pixels_interval(pixels_tensor, orig_tensor, output_dir, t_dim_ind
     torchvision.utils.save_image(grid, save_path)
 
 def visualize_spix(video_array, baseline_array, tubelets, selected_tubes, output_path):
-    masked_frames = cv_utils.apply_universal_mask(video_array, baseline_array, tubelets, selected_tubes)
+    masked_frames = apply_universal_mask(video_array, baseline_array, tubelets, selected_tubes)
     masked_frames[0].save(
         output_path, save_all=True, append_images=masked_frames[1:], duration=250, loop=0
     )

@@ -101,16 +101,16 @@ def plot_and_save_auc(percentages, ins_curve, del_curve, auc_ins, auc_del, prob_
     plt.savefig(os.path.join(output_dir, f"{ivd}_auc_curves.png"))
     plt.close()
 
-def evaluate_auc(args, model, processor, full_ids, output_ids, frames, video_array, tubelets, selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=0, positions=None, num_steps=20):
+def evaluate_auc(args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=0, positions=None, num_steps=20):
     eprint("\n--- Starting Clean AUC Evaluation ---")
     T, H, W, _ = video_array.shape
     
     baseline_ins_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins_arr]
     baseline_del_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del_arr]
     
-    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions)
-    prob_blur = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions)
-    prob_del_base = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions)
+    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions, tokenizer)
+    prob_blur = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions, tokenizer)
+    prob_del_base = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions, tokenizer)
     
     # Rank the pixels (Higher value = More Important)
     pixel_ranks = np.zeros((T, H, W), dtype=np.float32)
@@ -139,14 +139,14 @@ def evaluate_auc(args, model, processor, full_ids, output_ids, frames, video_arr
         # f=0: Original video. f=1: Baseline masked video.
         del_array = np.where(mask_expanded, baseline_del_arr, video_array).astype(np.uint8)
         frames_del = [Image.fromarray(frm) for frm in del_array]
-        p_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions)
+        p_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions, tokenizer)
         del_curve_raw.append(p_del)
 
         # -- Insertion --
         # f=0: Baseline blurred video. f=1: Original video.
         ins_array = np.where(mask_expanded, video_array, baseline_ins_arr).astype(np.uint8)
         frames_ins = [Image.fromarray(frm) for frm in ins_array]
-        p_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions)
+        p_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions, tokenizer)
         ins_curve_raw.append(p_ins)
 
     # Standard XAI Metric Normalization (Clamped to prevent > 1.0 anomalies)

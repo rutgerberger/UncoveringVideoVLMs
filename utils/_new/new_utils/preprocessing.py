@@ -54,7 +54,7 @@ def get_baseline_insertion(args, video_array):
 def get_baseline_deletion(args, video_array):
     """Returns the masking canvas used for Deletion metrics (White)."""
     #return np.zeros_like(video_array)
-    return precompute_blurred_video(video_array)
+    return get_baseline_insertion(args, video_array) # For now just the same as insertion
     return np.full_like(video_array, 255) # Constant white video
 
 def _run_slic_isolated(video_down_float, n_segments, compactness):

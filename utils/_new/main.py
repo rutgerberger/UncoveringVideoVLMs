@@ -99,7 +99,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
  
     # Get AUC metrics
     auc_ins, auc_del = evaluate_auc(
-        args, model, processor, full_ids, output_ids, frames, video_array, tubelets, 
+        args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, 
         selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_mask", positions=positions
     )
     
@@ -182,10 +182,10 @@ def explain_data(data, model, processor, args, tokenizer):
         baseline_del_arr = get_baseline_deletion(args, video_array)
         baseline_ins_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins_arr]
         baseline_del_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del_arr]
-        if getattr(args, 'save_visuals', True):
-            eprint(f"Visualizing baseline frames for video {ivd}...")
-            visualize_frames(baseline_ins_frames, os.path.join(args.output_dir, f"{ivd}_baseline_insertion.gif"))
-            visualize_frames(baseline_del_frames, os.path.join(args.output_dir, f"{ivd}_baseline_deletion.gif"))
+        # if getattr(args, 'save_visuals', True):
+        #     eprint(f"Visualizing baseline frames for video {ivd}...")
+        #     visualize_frames(baseline_ins_frames, os.path.join(args.output_dir, f"{ivd}_baseline_insertion.gif"))
+        #     visualize_frames(baseline_del_frames, os.path.join(args.output_dir, f"{ivd}_baseline_deletion.gif"))
 
         #Main pipeline
         metrics = explain_vid(
@@ -238,7 +238,7 @@ if __name__ == "__main__":
     tokenizer = processor.tokenizer
     for param in model.parameters(): param.requires_grad = False
     model.gradient_checkpointing = True
-    eprint("Model Mapping:", model.hf_device_map)
+    eprint("Model Mapping:", getattr(model, 'hf_device_map', model.device))
 
     eprint("Loading Dataset...")
     if getattr(args, 'dataset', '') == 'TGIF':
