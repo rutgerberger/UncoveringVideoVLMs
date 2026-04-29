@@ -19,6 +19,8 @@ def init_args():
     parser.add_argument('--popsize', type=int, default=20)
     parser.add_argument('--normalize_weights', type=lambda x: (str(x).lower() == 'true'), default=True)
     parser.add_argument('--randomize_data', type=lambda x: (str(x).lower() == 'true'), default=False)
+    parser.add_argument('--use_hierarchical', type=lambda x: (str(x).lower() == 'true'), default=True)
+    parser.add_argument('--mask_mode', type=str, default="joint")
 
 
     parser.add_argument(
@@ -120,40 +122,6 @@ def init_args():
         default=False,
         help='Whether to run the XAI explanation using the ground truth answer (Teacher Forcing).'
     )
-
-    # parser.add_argument(
-    #     '--opt_mode',
-    #     type=str,
-    #     default='combined',
-    #     choices=['insertion', 'deletion', 'combined'],
-    #     help="Optimization mode: 'insertion' (sufficiency), 'deletion' (necessity), or 'combined'."
-    # )
-
-    # parser.add_argument(
-    #     '--certainty_ratio',
-    #     type=float,
-    #     default=0.80,
-    #     help='When SPIX should stop (we recovered above X % of original probability)'
-    # )
-
-    # parser.add_argument(
-    #     '--min_gain_ratio',
-    #     type=float,
-    #     default=0.02,
-    #     help='When SPIX should stop (marginal gain is below X % of original probability)'
-    # )
-
-    # parser.add_argument(
-    #     '--use_dynamic_lambda',
-    #     type=lambda x: (str(x).lower() == 'true'), 
-    #     default=False,
-    #     help='Calculate the lambda balancing scalar dynamically at Step 0 to balance insertion vs deletion.'
-    # )
-
-    # parser.add_argument(
-    #     '--k',
-    #     type=int,
-    #     default=15)
 
     # LVLM generation settings
     parser.add_argument("--temperature", type=float,default=0)

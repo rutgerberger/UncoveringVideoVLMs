@@ -1,11 +1,4 @@
-import sys
-from textwrap import fill
-
-def eprint(*args, **kwargs):
-    sep = ' '
-    combined_text = sep.join(str(arg) for arg in args)
-    wrapped_lines = [fill(line, width=80) if line.strip() else "" for line in combined_text.splitlines()]
-    print("\n".join(wrapped_lines), file=sys.stderr, **kwargs)
+from new_utils.logging import eprint
 
 eprint("Loading libraries 1/3...")
 import os
@@ -15,59 +8,42 @@ import time
 import pickle
 import random
 import datetime
-from dotenv import load_dotenv
 
 eprint("Loading libraries 2/3...")
 import torch
 import numpy as np
 import pandas as pd
+
 from PIL import Image
-from skimage.segmentation import slic, mark_boundaries
+from dotenv import load_dotenv
 from datasets import load_dataset
+
 from transformers import VideoLlavaForConditionalGeneration, VideoLlavaProcessor
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 eprint("Importing files 3/3...")
-from utils import *
-from method_helpers import *
-from method import (
-    spix_cmaes, 
-    spix_hierarchical_cmaes,
-    spix_gradient_iterative, 
-    spix_rise_perturbation, 
-    frame_redundancy, 
-)
+
+from new_utils import *
+from optimizer import process_video, spix_gradient_iterative
 from args import init_args
-from iGOS.method import iGOS_p, perform_igos
 
 load_dotenv()
 DEFAULT_VIDEO_TOKEN = "<video>"
 
-
-def xai_method(args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, baseline_ins_arr, baseline_del_arr, positions, ivd):
+def xai_method(args, model, tokenizer, processor, input_ids, output_ids, full_ids, frames, tubelets, baseline_ins_arr, baseline_del_arr, positions, ivd):
     """
     Returns the XAI method of preference (for testing)
     """
-    method = getattr(args, 'method', 'sa')
+    method = getattr(args, 'method', 'cmaes')
     if method == 'cmaes':
-        return spix_cmaes(
-            args, model, tokenizer, processor, input_ids, output_ids, 
+        return process_video(
+            args, model, tokenizer, processor, output_ids, full_ids,
             frames, tubelets, baseline_ins_arr, baseline_del_arr, positions=positions
         )
-    elif method == 'hierarchical_cmaes':
-        return spix_hierarchical_cmaes(
-            args, model, tokenizer, processor, input_ids, output_ids, 
-            frames, tubelets, baseline_ins_arr, baseline_del_arr, positions=positions
-        )
-    elif method == 'spix':
+    else:
         return spix_gradient_iterative(
             args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets,
             positions=positions, max_stages=getattr(args, 'max_stages', 2), index=ivd
-        )
-    else:
-        return spix_rise_perturbation(
-             args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets,
-             positions=positions
         )
 
 
@@ -83,7 +59,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
 
     eprint(f"{ivd+1}/{args.num_videos}: Selecting Keywords ({mode_name}).")
     positions, keywords = find_keywords(
-        args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, 
+        args, model, processor, input_ids, output_ids, full_ids, frames, baseline_ins_frames, 
         target_text, tokenizer=tokenizer, use_yake=args.use_yake, special_ids=special_ids
     )
 
@@ -92,29 +68,24 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         return auc_ins, auc_del, auc_ins, auc_del
 
     eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
-    selected_ins, selected_del, scores_ins, scores_del, insertion_metrics, deletion_metrics = xai_method(
-        args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets, 
+    
+    # Unpack the unified mask outputs (Assuming process_video returns 3 items now: selected, scores, metrics)
+    selected_tubes, scores, metrics = xai_method(
+        args, model, tokenizer, processor, input_ids, output_ids, full_ids, frames, tubelets, 
         baseline_ins_arr, baseline_del_arr, positions, ivd
     )
-    
-    # Merging mask
-    scores_merged = {}
-    unique_tubes = np.unique(tubelets)
-    for t in unique_tubes:
-        scores_merged[t] = scores_ins.get(t, 0.0) * scores_del.get(t, 0.0)
-    selected_merged = sorted(list(unique_tubes), key=lambda t: scores_merged[t], reverse=True)
 
     # Evaluation (calculating metrics, etc.)
-    full_ids = torch.cat((input_ids, output_ids), dim=1)
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions=positions, tokenizer=tokenizer)
     prob_baseline_del = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions=positions, tokenizer=tokenizer)
     prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions=positions, tokenizer=tokenizer)
-
+    
     # ... for evaluation, we show what happens when deleting / inserting our mask!
-    k_fraction = 0.50
+    unique_tubes = np.unique(tubelets)
+    k_fraction = 0.25
     k_tubes = max(1, int(len(unique_tubes) * k_fraction))
 
-    top_final = selected_merged[:k_tubes]
+    top_final = selected_tubes[:k_tubes]
     frames_ins = apply_universal_mask(video_array, baseline_ins_arr, tubelets, top_final)
     prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions=positions, tokenizer=tokenizer)
     
@@ -122,22 +93,20 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     frames_del = apply_universal_mask(video_array, baseline_del_arr, tubelets, keep_tubes_del)
     prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions=positions, tokenizer=tokenizer)
 
-    top_k = min(5, len(selected_ins))
-    fmt_ins = {t: f"{scores_ins.get(t, 0):.4f}" for t in selected_ins[:top_k]}
-    fmt_del = {t: f"{scores_del.get(t, 0):.4f}" for t in selected_del[:top_k]}
-    fmt_merged = {t: f"{scores_merged.get(t, 0):.4f}" for t in selected_merged[:top_k]}
+    top_k = min(5, len(selected_tubes))
+    fmt_scores = {t: f"{scores.get(t, 0):.4f}" for t in selected_tubes[:top_k]}
  
     # Get AUC metrics
     auc_ins, auc_del = evaluate_auc(
-        args, model, processor, full_ids, output_ids, frames, video_array, tubelets, 
-        selected_merged, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_merged", positions=positions
+        args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, 
+        selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_mask", positions=positions
     )
     
     #All the data will be logged in log.txt
     log_experiment(args, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
         prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, auc_ins, auc_del,
-        deletion_metrics, insertion_metrics, top_k, fmt_ins, fmt_del, fmt_merged, 
-        selected_ins, selected_del, selected_merged, unique_tubes, k_fraction, mode_name, start
+        metrics, metrics, top_k, fmt_scores, fmt_scores, fmt_scores, 
+        selected_tubes, selected_tubes, selected_tubes, unique_tubes, k_fraction, mode_name, start
     )
 
     if getattr(args, 'save_visuals', True):
@@ -146,9 +115,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         keep_tubes_vis = [t for t in unique_tubes if t not in top_final]
         visualize_spix(video_array, baseline_del_arr, tubelets, keep_tubes_vis, os.path.join(args.output_dir, f"{ivd}_{file_prefix}mask_cutout.gif"))
         # Continuous heatmaps
-        visualize_heatmap(video_array, tubelets, scores_ins, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_ins.gif"))
-        visualize_heatmap(video_array, tubelets, scores_del, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_del.gif"))
-        visualize_heatmap(video_array, tubelets, scores_merged, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_merged.gif"))
+        visualize_heatmap(video_array, tubelets, scores, os.path.join(args.output_dir, f"{ivd}_{file_prefix}highlight_mask.gif"))
 
     return {
         "auc_ins": auc_ins,
@@ -181,16 +148,19 @@ def explain_data(data, model, processor, args, tokenizer):
     def log(msg):
         with open(log_file, "a") as f:
             f.write(str(msg) + "\n")
-
-    num_videos = min(len(data), args.num_videos) if args.num_videos > 0 else len(data)
+    # For evaluation
+    target_num_videos = min(len(data), args.num_videos) if args.num_videos > 0 else len(data)
     global_metrics = []
     global_gt_metrics = []
-
+    
     if args.randomize_data == True:
         random.shuffle(data)
 
-    for ivd in range(num_videos):
-        eprint(f"\n{ivd+1}/{num_videos}: Retrieving data.")
+    explained_count = 0
+    for ivd in range(len(data)):
+        if explained_count >= target_num_videos:
+            break
+        eprint(f"\nProcessing target {explained_count+1}/{target_num_videos} (Row {ivd}): Retrieving data.")
         start = time.time()
 
         #Load current question, frame and ground truth (if avail)
@@ -203,28 +173,36 @@ def explain_data(data, model, processor, args, tokenizer):
             continue
         eprint(f"Retrieved data in {time.time() - start:.2f}s")
 
-        eprint(f"{ivd+1}/{args.num_videos}: Creating Tubelets and Baseline Frames.")
-        video_array, tubelets = generate_tubelets_optimized(frames, args)
         #Get original answer of the model (with token IDs)
         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
         special_ids = [idx for idx in [tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id] if idx is not None]
+        full_ids = torch.cat((input_ids, output_ids), dim=1)
+
         #Obtain baseline videos (and save if desired)- we do it here once (saves time)
+        eprint(f"{ivd+1}/{args.num_videos}: Creating Tubelets and Baseline Frames.")
+        video_array, tubelets = generate_tubelets_optimized(frames, args)
         baseline_ins_arr = get_baseline_insertion(args, video_array)
         baseline_del_arr = get_baseline_deletion(args, video_array)
         baseline_ins_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins_arr]
         baseline_del_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del_arr]
-        if getattr(args, 'save_visuals', True):
-            eprint(f"Visualizing baseline frames for video {ivd}...")
-            visualize_frames(baseline_ins_frames, os.path.join(args.output_dir, f"{ivd}_baseline_insertion.gif"))
-            visualize_frames(baseline_del_frames, os.path.join(args.output_dir, f"{ivd}_baseline_deletion.gif"))
-
+        # if getattr(args, 'save_visuals', True):
+        #     eprint(f"Visualizing baseline frames for video {ivd}...")
+        #     visualize_frames(baseline_ins_frames, os.path.join(args.output_dir, f"{ivd}_baseline_insertion.gif"))
+        #     visualize_frames(baseline_del_frames, os.path.join(args.output_dir, f"{ivd}_baseline_deletion.gif"))
+        
+        PROB_DROP_THRESHOLD = 0.30
+        if get_prob_drop(args, model, processor, full_ids, output_ids, frames, tokenizer) < PROB_DROP_THRESHOLD:
+            eprint("Visual evidence too little. Skipping video")
+            continue
+            
         #Main pipeline
         metrics = explain_vid(
             args, model, processor, tokenizer, frames, video_array, tubelets, 
             baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, special_ids,
-            input_ids, output_ids, qs, ground_truth_label, output_text, output_text, ivd, log, 
+            input_ids, output_ids, full_ids,qs, ground_truth_label, output_text, output_text, ivd, log, 
             mode_name="STANDARD", file_prefix=""
         )
+
         global_metrics.append(metrics)
 
         if getattr(args, 'gt_forcing', False):    
@@ -241,12 +219,15 @@ def explain_data(data, model, processor, args, tokenizer):
         gc.collect()
         torch.cuda.empty_cache()
 
+        explained_count+=1
+
     if global_metrics:
         log_metrics(args, global_metrics)
     if global_gt_metrics:
         log_metrics(args, global_gt_metrics, prefix="GT-")
 
     eprint(f"\nExperiment Complete. Mean metrics saved to {args.output_dir}/final_metrics.json")
+
 
 if __name__ == "__main__":
     args = init_args()
@@ -268,7 +249,7 @@ if __name__ == "__main__":
     tokenizer = processor.tokenizer
     for param in model.parameters(): param.requires_grad = False
     model.gradient_checkpointing = True
-    eprint("Model Mapping:", model.hf_device_map)
+    eprint("Model Mapping:", getattr(model, 'hf_device_map', model.device))
 
     eprint("Loading Dataset...")
     if getattr(args, 'dataset', '') == 'TGIF':
