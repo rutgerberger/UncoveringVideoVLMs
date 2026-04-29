@@ -22,7 +22,7 @@ def eprint(*args, **kwargs):
 
 def log_experiment(args, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
                    prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, auc_ins, auc_del,
-                   deletion_metrics, insertion_metrics, top_k, fmt_ins, fmt_del, fmt_merged, 
+                   metrics, top_k, fmt_ins, fmt_del, fmt_merged, 
                    selected_ins, selected_del, selected_merged, unique_tubes, k_fraction, mode_name, start_time):
 
     """Handles single experiment logging"""
@@ -39,8 +39,7 @@ def log_experiment(args, log_func, ivd, question_text, ground_truth, model_answe
         "Prob del": round(prob_del,3),
         "AUC Ins": round(auc_ins,3),
         "AUC Del": round(auc_del,3),
-        "deletion_metrics": deletion_metrics,
-        "insertion_metrics": insertion_metrics,
+        "metrics": metrics
     }
     
     with open(metrics_file, "a") as f:
@@ -63,11 +62,12 @@ def log_experiment(args, log_func, ivd, question_text, ground_truth, model_answe
     log_func(f"Final Combined tubelets (Top {top_k}): {fmt_merged} ({len(selected_merged)}/{len(unique_tubes)})")
     log_func(f"Prob when Inserting Mask (top {k_fraction*100}%): {prob_ins:.5f} (Diff: {prob_orig - prob_ins:.5f})")
     log_func(f"Prob when Deleting Mask (top {k_fraction*100}%): {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
-
-    log_func(f"\n=== Experiment Metrics ===\n")
-    log_func(f"Insertion Landscape -> d_eff: {insertion_metrics.get('d_eff', 0):.2f} | Diversity (L1): {insertion_metrics.get('diversity', 0):.4f} (from {insertion_metrics.get('num_top_candidates', 0)} top masks)")
-    log_func(f"Deletion Landscape  -> d_eff: {deletion_metrics.get('d_eff', 0):.2f} | Diversity (L1): {deletion_metrics.get('diversity', 0):.4f} (from {deletion_metrics.get('num_top_candidates', 0)} top masks)")
     log_func(f"\nAUC Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
+    
+    # log_func(f"\n=== Experiment Metrics ===\n")
+    # log_func(f"Insertion Landscape -> d_eff: {insertion_metrics.get('d_eff', 0):.2f} | Diversity (L1): {insertion_metrics.get('diversity', 0):.4f} (from {insertion_metrics.get('num_top_candidates', 0)} top masks)")
+    # log_func(f"Deletion Landscape  -> d_eff: {deletion_metrics.get('d_eff', 0):.2f} | Diversity (L1): {deletion_metrics.get('diversity', 0):.4f} (from {deletion_metrics.get('num_top_candidates', 0)} top masks)")
+    # log_func(f"\nAUC Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
 
 
 def log_metrics(args, metrics, prefix=""):
