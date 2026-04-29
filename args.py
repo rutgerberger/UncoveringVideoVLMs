@@ -21,7 +21,7 @@ def init_args():
     parser.add_argument('--iterations', type=int, default=15)
     parser.add_argument('--popsize', type=int, default=20)
     parser.add_argument('--use_hierarchical', type=lambda x: (str(x).lower() == 'true'), default=True)
-    parser.add_argument('--mask_mode', type=str, default="joint", choices=["separate", "insertion", "deletion"])
+    parser.add_argument('--mask_mode', type=str, default="joint", choices=["joint", "separate", "insertion", "deletion"])
     #Super cluster args (if hierarchical)
     parser.add_argument('--super_clusters', type=int, default=20)
     parser.add_argument('--freeze_losers', type=lambda x: (str(x).lower() == 'true'), default=False)   

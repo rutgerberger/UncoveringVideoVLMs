@@ -25,7 +25,7 @@ eprint("Importing files 3/3...")
 
 from utils import *
 from optimizer import process_video, spix_gradient_iterative
-from IGOS.igos_framewise import video_iGOS_pp
+from iGOS.igos_framewise import video_iGOS_pp
 from args import init_args
 
 load_dotenv()
