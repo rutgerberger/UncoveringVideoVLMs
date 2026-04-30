@@ -12,6 +12,8 @@ import os
 import json
 import numpy as np
 
+from qwen_vl_utils import process_vision_info
+
 def exp_decay(init, iter, gamma=0.2):
     return init * math.exp(-gamma * iter)
 
@@ -75,7 +77,7 @@ def phi_tensor(img_tensor, baseline_tensor, mask):
 
 def spatio_temporal_bilateral_tv(video, mask, tv_beta=2, sigma=0.01, lambda_t=0.5):
     """
-    video: (T, C, H, W) or (1, T, C, H, W)
+    video: (T, C, H, W) or (1, T, C, H, W) or 2D flattened sequence (Qwen)
     mask: (T, 1, size, size)
     lambda_t: weight for temporal smoothness
     """
@@ -83,6 +85,23 @@ def spatio_temporal_bilateral_tv(video, mask, tv_beta=2, sigma=0.01, lambda_t=0.
     if video.dim() == 5 and video.shape[0] == 1:
         video = video.squeeze(0)
         
+    # --- QWEN FALLBACK: Standard TV on the Mask ---
+    # If video is flattened (2D), we skip bilateral edge-weighting
+    if video.dim() < 4:
+        dh_mask = torch.abs(mask[:, :, :-1, :] - mask[:, :, 1:, :]).pow(tv_beta)
+        dw_mask = torch.abs(mask[:, :, :, :-1] - mask[:, :, :, 1:]).pow(tv_beta)
+        spatial_tv = torch.mean(dh_mask) + torch.mean(dw_mask)
+        
+        # Temporal TV
+        if mask.shape[0] > 1: 
+            dt_mask = torch.abs(mask[:-1, :, :, :] - mask[1:, :, :, :]).pow(tv_beta)
+            temporal_tv = torch.mean(dt_mask)
+        else:
+            temporal_tv = 0.0
+            
+        return spatial_tv + (lambda_t * temporal_tv)
+
+    # --- STANDARD: Bilateral TV ---
     # Upscale mask to match video resolution for element-wise operations
     up_mask = F.interpolate(mask, size=(video.shape[-2], video.shape[-1]), mode='bilinear', align_corners=False)
     dh_mask = torch.abs(up_mask[:, :, :-1, :] - up_mask[:, :, 1:, :]).pow(tv_beta)
@@ -94,7 +113,7 @@ def spatio_temporal_bilateral_tv(video, mask, tv_beta=2, sigma=0.01, lambda_t=0.
     
     spatial_tv = torch.mean(dh_img * dh_mask) + torch.mean(dw_img * dw_mask)
 
-    #Temporal TV (T dimension) to prevent flickering
+    # Temporal TV (T dimension) to prevent flickering
     if up_mask.shape[0] > 1: # If T > 1
         dt_mask = torch.abs(up_mask[:-1, :, :, :] - up_mask[1:, :, :, :]).pow(tv_beta)
         dt_img = torch.exp(-(video[:-1, :, :, :] - video[1:, :, :, :]).mean(dim=1, keepdim=True)**2 / sigma)
@@ -104,14 +123,18 @@ def spatio_temporal_bilateral_tv(video, mask, tv_beta=2, sigma=0.01, lambda_t=0.
         
     return spatial_tv + (lambda_t * temporal_tv)
 
-def integrated_gradient_framewise(args, model, full_ids, output_ids, img_tensor, base_tensor, mask, num_iter, positions, target_H, target_W, target_T, is_qwen=False, video_grid_thw=None):
+def integrated_gradient_framewise(args, model, full_ids, output_ids, img_tensor, base_tensor, mask_input, num_iter, positions, target_H, target_W, target_T, is_qwen=False, video_grid_thw=None):
     intervals = torch.linspace(1/num_iter, 1, num_iter, device=img_tensor.device).view(-1, 1, 1, 1, 1)
     total_loss = 0.0
     
     for alpha in intervals:
+        if isinstance(mask_input, tuple):
+            mask = mask_input[0] * mask_input[1]
+        else:
+            mask = mask_input
         # Mask is (T, 1, size, size) -> Upscale to (T, 1, target_H, target_W)
         up_mask = F.interpolate(mask, size=(target_H, target_W), mode='bilinear', align_corners=False)
-        
+
         if is_qwen:
             # Qwen expects a flat sequence of patches (T * H * W, 1)
             interval_mask = up_mask.reshape(-1, 1) * alpha.view(1)
@@ -168,29 +191,27 @@ def video_iGOS_pp(
         return loss_l1, loss_tv, loss_l2
 
     print("\nStarting video_iGOS++ Frame-wise Optimization...")
-    for i in range(iterations):
-        comb_mask = masks_del * masks_ins
-        
-        # Combined Deletion IG
-        loss_comb_del = integrated_gradient_framewise(args, model, full_ids, output_ids, image, baseline, comb_mask, ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
+    for i in range(iterations):        
+    # Combined Deletion IG (Pass as a tuple)
+        loss_comb_del = integrated_gradient_framewise(args, model, full_ids, output_ids, image, baseline, (masks_del, masks_ins), ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
         total_grads1 = masks_del.grad.clone() if masks_del.grad is not None else torch.zeros_like(masks_del)
         total_grads2 = masks_ins.grad.clone() if masks_ins.grad is not None else torch.zeros_like(masks_ins)
         if masks_del.grad is not None: masks_del.grad.zero_()
         if masks_ins.grad is not None: masks_ins.grad.zero_()
 
-        # Combined Insertion IG
-        loss_comb_ins = integrated_gradient_framewise(args, model, full_ids, output_ids, baseline, image, comb_mask, ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
+        # Combined Insertion IG (Pass as a tuple)
+        loss_comb_ins = integrated_gradient_framewise(args, model, full_ids, output_ids, baseline, image, (masks_del, masks_ins), ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
         total_grads1 -= masks_del.grad.clone()
         total_grads2 -= masks_ins.grad.clone()
         masks_del.grad.zero_()
         masks_ins.grad.zero_()
 
-        # Individual Deletion IG
+        # Individual Deletion IG (Pass normally)
         loss_del = integrated_gradient_framewise(args, model, full_ids, output_ids, image, baseline, masks_del, ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
         total_grads1 += masks_del.grad.clone()
         masks_del.grad.zero_()
 
-        # Individual Insertion IG
+        # Individual Insertion IG (Pass normally)
         loss_ins = integrated_gradient_framewise(args, model, full_ids, output_ids, baseline, image, masks_ins, ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
         total_grads2 -= masks_ins.grad.clone()
         masks_ins.grad.zero_()
@@ -198,7 +219,8 @@ def video_iGOS_pp(
         total_grads1 /= 2
         total_grads2 /= 2
 
-        # Regularization
+        # Regularization (Calculate it here since regularization uses a single backward pass)
+        comb_mask = masks_del * masks_ins
         current_L2 = exp_decay(L2, i, getattr(args, 'gamma', 0.2))
         loss_l1, loss_tv, loss_l2_val = regularization_loss(comb_mask, current_L2)
         losses = loss_l1.sum() + loss_tv + loss_l2_val.sum()
