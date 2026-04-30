@@ -11,8 +11,24 @@ from torch.autograd import Variable
 import os
 import json
 import numpy as np
+import sys
+
 
 from qwen_vl_utils import process_vision_info
+
+def eprint(*args, **kwargs):
+    """Helper to log to stderr."""
+    sep = ' '
+    combined_text = sep.join(str(arg) for arg in args)
+    wrapped_lines = []
+    for line in combined_text.splitlines():
+        if line.strip() == "":
+            wrapped_lines.append("")
+        else:
+            wrapped_lines.append(fill(line, width=80))
+    final_text = "\n".join(wrapped_lines)
+    print(final_text, file=sys.stderr, **kwargs)
+    
 
 def exp_decay(init, iter, gamma=0.2):
     return init * math.exp(-gamma * iter)
@@ -190,7 +206,7 @@ def video_iGOS_pp(
         loss_l2 = current_L2 * torch.sum((1 - masks)**2, dim=[1, 2, 3])
         return loss_l1, loss_tv, loss_l2
 
-    print("\nStarting video_iGOS++ Frame-wise Optimization...")
+    eprint("\nStarting video_iGOS++ Frame-wise Optimization...")
     for i in range(iterations):        
     # Combined Deletion IG (Pass as a tuple)
         loss_comb_del = integrated_gradient_framewise(args, model, full_ids, output_ids, image, baseline, (masks_del, masks_ins), ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
@@ -310,7 +326,7 @@ def evaluate_auc_pixel_framewise(args, model, processor, full_ids, output_ids, f
 
 def run_igos(args, model, processor, full_ids, output_ids, frames, baseline_frames, positions, ivd):
     start = time.time()
-    print("Running iGOS++ Frame-wise Optimization...")
+    eprint("Running iGOS++ Frame-wise Optimization...")
     
     final_mask, target_H, target_W, target_T, video_grid_thw, img_tensor, base_tensor = video_iGOS_pp(
         args, model, processor, full_ids, output_ids, frames, baseline_frames, positions,
@@ -323,8 +339,8 @@ def run_igos(args, model, processor, full_ids, output_ids, frames, baseline_fram
         positions, target_H, target_W, target_T, is_qwen, video_grid_thw, size=32
     )
     
-    print(f"iGOS++ Time: {(time.time() - start):.2f}s")
-    print(f"AUC iGOS++ | Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
+    eprint(f"iGOS++ Time: {(time.time() - start):.2f}s")
+   e print(f"AUC iGOS++ | Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
     
     experiment_data = {
         "video_index": ivd,
