@@ -260,7 +260,7 @@ def run_igos(args, model, processor, full_ids, output_ids, frames, baseline_fram
     start = time.time()
     print("Running iGOS++ Frame-wise Optimization...")
     
-    final_mask, target_H, target_W, target_T, video_grid_thw, img_tensor, base_tensor = video_iGOS_pp_framewise(
+    final_mask, target_H, target_W, target_T, video_grid_thw, img_tensor, base_tensor = video_iGOS_pp(
         args, model, processor, full_ids, output_ids, frames, baseline_frames, positions,
         lr=10, L1=1, L2=1, L3=20, size=32, iterations=15, ig_iter=6
     )

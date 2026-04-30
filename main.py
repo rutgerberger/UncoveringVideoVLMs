@@ -25,7 +25,7 @@ eprint("Importing files 3/3...")
 
 from utils import *
 from optimizer import process_video, spix_gradient_iterative
-from iGOS.igos_framewise import video_iGOS_pp
+from iGOS.igos_framewise import run_igos 
 from args import init_args
 
 load_dotenv()
@@ -51,7 +51,7 @@ def xai_method(args, model, tokenizer, processor, input_ids, output_ids, full_id
 
 def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets, 
                      baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, 
-                     special_ids, input_ids, output_ids, question_text, ground_truth, model_answer, 
+                     special_ids, input_ids, output_ids, full_ids, question_text, ground_truth, model_answer, 
                      target_text, ivd, log_func, mode_name, file_prefix):
     """
     Runs XAI pipeline for a single video and handles logging
@@ -60,7 +60,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
 
     eprint(f"{ivd+1}/{args.num_videos}: Selecting Keywords ({mode_name}).")
     positions, keywords = find_keywords(
-        args, model, processor, input_ids, output_ids, full_ids, frames, baseline_ins_frames, 
+        args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, 
         target_text, tokenizer=tokenizer, use_yake=args.use_yake, special_ids=special_ids
     )
 
@@ -119,7 +119,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     #All the data will be logged in log.txt
     log_experiment(args, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
         prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, auc_ins, auc_del,
-        metrics, metrics, top_k, fmt_scores, fmt_scores, fmt_scores, 
+        metrics, top_k, fmt_scores, fmt_scores, fmt_scores, 
         selected_tubes, selected_tubes, selected_tubes, unique_tubes, k_fraction, mode_name, start
     )
 
@@ -205,7 +205,7 @@ def explain_data(data, model, processor, args, tokenizer):
         #     visualize_frames(baseline_del_frames, os.path.join(args.output_dir, f"{ivd}_baseline_deletion.gif"))
         
         PROB_DROP_THRESHOLD = 0.30
-        if get_prob_drop(args, model, processor, full_ids, output_ids, frames, tokenizer) < PROB_DROP_THRESHOLD:
+        if get_prob_drop(args, model, processor, full_ids, baseline_ins_frames, output_ids, frames, tokenizer) < PROB_DROP_THRESHOLD:
             eprint("Visual evidence too little. Skipping video")
             continue
             

@@ -108,14 +108,14 @@ def get_prob(args, model, processor, full_ids, output_ids, frames, positions=Non
     probs = F.softmax(target_logits, dim=-1) 
     target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
     
-    if positions is not None and len(positions) > 0:
-        decoded_targets = [tokenizer.decode(idx) for idx in output_ids[0]]
-        eprint("\n--- TOKEN ALIGNMENT SANITY CHECK ---")
-        for pos in positions:
-            token_str = decoded_targets[pos]
-            prob_val = target_probs[0, pos].item()
-            eprint(f"Position {pos} | Token: '{token_str}' | Extracted Prob: {prob_val:.4f}")
-        eprint("------------------------------------\n")
+    #if positions is not None and len(positions) > 0:
+    #    decoded_targets = [tokenizer.decode(idx) for idx in output_ids[0]]
+    #    eprint("\n--- TOKEN ALIGNMENT SANITY CHECK ---")
+    #    for pos in positions:
+    #        token_str = decoded_targets[pos]
+    #        prob_val = target_probs[0, pos].item()
+    #        eprint(f"Position {pos} | Token: '{token_str}' | Extracted Prob: {prob_val:.4f}")
+    #    eprint("------------------------------------\n")
 
     if target_probs.dim() == 0:
         target_probs = target_probs.unsqueeze(0)

@@ -16,7 +16,7 @@ def init_args():
     parser.add_argument('--n_segments', type=int, default=120)
     parser.add_argument('--compactness', type=float, default=10.0)
     parser.add_argument('--cluster_temporal', type=lambda x: (str(x).lower() == 'true'), default=True)
-    parser.add_argument('--cluster_mode', type=str, default='3d', choices=['spatial', 'appearance'])
+    parser.add_argument('--cluster_mode', type=str, default='appearance', choices=['spatial', 'appearance'])
     #Optimizer
     parser.add_argument('--iterations', type=int, default=15)
     parser.add_argument('--popsize', type=int, default=20)

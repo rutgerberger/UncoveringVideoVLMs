@@ -176,7 +176,7 @@ def generate_tubelets_optimized(video, args, downsample_factor=0.5):
                 future = executor.submit(_run_slic_isolated, video_down_float, n_seg, comp)
             else:
                 # Divide total segments by T to keep CMA-ES parameter count stable
-                n_seg = 300
+                segments_per_frame = 30
                 future = executor.submit(_run_slic_2d_isolated, video_down_float, segments_per_frame, comp)
             tubelet_labels_down = future.result()
         

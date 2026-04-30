@@ -15,7 +15,7 @@ from .preprocessing import get_baseline_deletion, get_baseline_insertion
 
 
 
-def get_prob_drop(args, model, processor, full_ids, output_ids, frames, tokenizer):
+def get_prob_drop(args, model, processor, full_ids, baseline_ins_frames, output_ids, frames, tokenizer):
     log_prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, tokenizer=tokenizer)
     log_prob_baseline = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, tokenizer=tokenizer)
     # Calculate the actual probability ratio: e^(log_baseline - log_orig)

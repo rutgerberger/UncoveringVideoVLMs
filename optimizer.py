@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from PIL import Image
 
-from utils.preprocessing import rescale_mask, create_super_tubelets, get_baseline_insertion, get_baseline_deletion
+from utils.preprocessing import rescale_mask, create_super_tubelets, unpack_super_weights, get_baseline_insertion, get_baseline_deletion
 from utils.logging import eprint
 from utils.evaluation import tv_norm_3d, evaluate_fitness, evaluate_confidence
 from utils.model_utils import get_rescale_and_dummys, sigmoid, calculate_gradient
@@ -31,7 +31,7 @@ def CMA_ES(
     - mode='insertion': Only maximizes insertion log-likelihood.
     """
     
-    sigma_0 = 2.0 #HP
+    sigma_0 = 1.8 #HP
     iters = max_iters if max_iters is not None else getattr(args, 'iterations', 150)
     es_popsize = popsize if popsize is not None else getattr(args, 'popsize', 20)
 
