@@ -40,6 +40,36 @@ def get_token_probs_tensor(args, model, full_ids, output_ids, pixel_values, posi
         
     return target_probs
 
+def process_vid_qwen(processor, frames, prompt=" ", apply_chat_template=False, fps=1.0, max_pixels=112896):
+    """
+    Universal wrapper for Qwen's vision processor to prevent feature/token mismatches.
+    """
+    messages = [
+        {"role": "user", "content": [
+            {"type": "video", "video": frames, "fps": fps},
+            {"type": "text", "text": prompt},
+        ]},
+    ]
+    image_inputs, video_inputs = process_vision_info(messages)
+    
+    # Only format with the <|im_start|> tags if we are explicitly asking for an answer
+    if apply_chat_template:
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text_inputs = [text]
+    else:
+        text_inputs = [prompt]
+        
+    inputs = processor(
+        text=text_inputs, 
+        images=image_inputs, 
+        videos=video_inputs, 
+        padding=True, 
+        return_tensors="pt", 
+        max_pixels=max_pixels
+    )
+    
+    return inputs
+
 def phi_tensor(img_tensor, baseline_tensor, mask):
     return img_tensor * mask + baseline_tensor * (1.0 - mask)
 
@@ -109,8 +139,8 @@ def video_iGOS_pp(
     is_qwen = getattr(args, 'model', '') == 'qwen'
 
     if is_qwen:
-        inputs_orig = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896).to(model.device)
-        inputs_base = processor(text=[" "], videos=[baseline_frames], padding=True, return_tensors="pt", max_pixels=112896).to(model.device)
+        inputs_orig = process_vid_qwen(processor, frames, prompt=" ", max_pixels=112896).to(model.device)
+        inputs_base = process_vid_qwen(processor, baseline_frames, prompt=" ", max_pixels=112896).to(model.device)
         video_grid_thw = inputs_orig['video_grid_thw']
         target_T, target_H, target_W = video_grid_thw[0][0].item(), video_grid_thw[0][1].item(), video_grid_thw[0][2].item()
     else:
