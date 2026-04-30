@@ -31,7 +31,7 @@ def CMA_ES(
     - mode='insertion': Only maximizes insertion log-likelihood.
     """
     
-    sigma_0 = 1.8 #HP
+    sigma_0 = 1.0 #HP
     iters = max_iters if max_iters is not None else getattr(args, 'iterations', 150)
     es_popsize = popsize if popsize is not None else getattr(args, 'popsize', 20)
 

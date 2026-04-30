@@ -12,6 +12,10 @@ import os
 import json
 import numpy as np
 import sys
+import cv2
+import matplotlib.pyplot as plt
+
+from textwrap import fill
 
 
 from qwen_vl_utils import process_vision_info
@@ -101,8 +105,9 @@ def spatio_temporal_bilateral_tv(video, mask, tv_beta=2, sigma=0.01, lambda_t=0.
     if video.dim() == 5 and video.shape[0] == 1:
         video = video.squeeze(0)
         
-    # --- QWEN FALLBACK: Standard TV on the Mask ---
-    # If video is flattened (2D), we skip bilateral edge-weighting
+    if video.dim() == 4 and video.shape[1] == mask.shape[0]: 
+        video = video.permute(1, 0, 2, 3)
+        
     if video.dim() < 4:
         dh_mask = torch.abs(mask[:, :, :-1, :] - mask[:, :, 1:, :]).pow(tv_beta)
         dw_mask = torch.abs(mask[:, :, :, :-1] - mask[:, :, :, 1:]).pow(tv_beta)
@@ -114,15 +119,12 @@ def spatio_temporal_bilateral_tv(video, mask, tv_beta=2, sigma=0.01, lambda_t=0.
             temporal_tv = torch.mean(dt_mask)
         else:
             temporal_tv = 0.0
-            
         return spatial_tv + (lambda_t * temporal_tv)
 
-    # --- STANDARD: Bilateral TV ---
     # Upscale mask to match video resolution for element-wise operations
     up_mask = F.interpolate(mask, size=(video.shape[-2], video.shape[-1]), mode='bilinear', align_corners=False)
     dh_mask = torch.abs(up_mask[:, :, :-1, :] - up_mask[:, :, 1:, :]).pow(tv_beta)
     dw_mask = torch.abs(up_mask[:, :, :, :-1] - up_mask[:, :, :, 1:]).pow(tv_beta)
-    
     # Extract edges from the video (for Bilateral weighting)
     dh_img = torch.exp(-(video[:, :, :-1, :] - video[:, :, 1:, :]).mean(dim=1, keepdim=True)**2 / sigma)
     dw_img = torch.exp(-(video[:, :, :, :-1] - video[:, :, :, 1:]).mean(dim=1, keepdim=True)**2 / sigma)
@@ -264,11 +266,29 @@ def video_iGOS_pp(
     final_mask = masks_del * masks_ins
     return final_mask, target_H, target_W, target_T, video_grid_thw, image, baseline
 
+def plot_and_save_auc(percentages, ins_curve, del_curve, auc_ins, auc_del, prob_orig, prob_blur, output_dir, ivd):
+    """Handles matplotlib generation and disk I/O."""
+    plt.figure(figsize=(8, 6))
+    plt.plot(percentages, ins_curve, label=f'Insertion (AUC={auc_ins:.3f})', color='green', marker='o')
+    plt.plot(percentages, del_curve, label=f'Deletion (AUC={auc_del:.3f})', color='red', marker='x')
+    plt.axhline(y=prob_orig, color='gray', linestyle='--', label='Original Prob')
+    plt.axhline(y=prob_blur, color='blue', linestyle='--', label='Blurred Prob')
+    
+    plt.title("Insertion / Deletion Curves")
+    plt.xlabel("Fraction of Total Video Pixels Revealed/Masked")
+    plt.ylabel("Target Probability")
+    plt.legend()
+    plt.grid(True)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, f"{ivd}_auc_curves.png"))
+    plt.close()
+
 
 def evaluate_auc_pixel_framewise(args, model, processor, full_ids, output_ids, final_mask, image_tensor, baseline_tensor, positions, target_H, target_W, target_T, is_qwen, video_grid_thw, size=32):
     """
     Evaluates AUC by globally sorting pixels across the entire Spatio-Temporal mask.
-    final_mask: (T, 1, size, size) tensor.
+    Mathematically aligned with iGOS++ and constrained to [0, 1].
     """
     with torch.no_grad():
         num_pixels = target_T * size * size
@@ -276,23 +296,24 @@ def evaluate_auc_pixel_framewise(args, model, processor, full_ids, output_ids, f
 
         og_probs = get_token_probs_tensor(args, model, full_ids, output_ids, image_tensor, positions, is_qwen, video_grid_thw)
         blur_probs = get_token_probs_tensor(args, model, full_ids, output_ids, baseline_tensor, positions, is_qwen, video_grid_thw)
-        og_scores = og_probs.mean().item()
-        blur_scores = blur_probs.mean().item()
+        
+        prob_orig = og_probs.mean().item()
+        prob_blur = blur_probs.mean().item()
 
-        del_curve, ins_curve = [og_scores], [blur_scores]
-        index_curve = [0.0]
+        del_curve_raw, ins_curve_raw = [prob_orig], [prob_blur]
+        fractions = [0.0]
 
+        # true_mask starts as all 1s (determines the blend ratio)
         true_mask = torch.ones((1, num_pixels), device=model.device)
-        del_auc_score, ins_auc_score = 0.0, 0.0
 
-        # Globally sort all pixels in the video
+        # Globally sort all pixels in the video (descending = highest gradients first)
         elements = torch.argsort(final_mask.view(1, -1), dim=1, descending=True)
 
         for pixels in range(0, num_pixels, step):
             indices = elements[:, pixels:pixels+step].squeeze(0)
-            true_mask[0, indices] = 0 
+            true_mask[0, indices] = 0 # Mask out the most important pixels
 
-            # Reshape back to (T, 1, size, size)
+            # Reshape back to (T, 1, size, size) and upsample
             spatial_mask = true_mask.view(target_T, 1, size, size)
             up_mask = F.interpolate(spatial_mask, size=(target_H, target_W), mode='bilinear', align_corners=False)
             
@@ -301,29 +322,68 @@ def evaluate_auc_pixel_framewise(args, model, processor, full_ids, output_ids, f
             else:
                 final_applied_mask = up_mask.permute(1, 0, 2, 3).unsqueeze(0)
 
-            # Deletion Score
+            # -- Deletion Score --
+            # Mask goes from 1 to 0 -> Image goes from Original to Baseline
             del_image = phi_tensor(image_tensor, baseline_tensor, final_applied_mask).to(dtype=model.dtype)
             del_probs = get_token_probs_tensor(args, model, full_ids, output_ids, del_image, positions, is_qwen, video_grid_thw)
-            d_score = del_probs.mean().item()
-            del_curve.append(d_score)
-            norm_d = (d_score - blur_scores) / (og_scores - blur_scores + 1e-7)
-            del_auc_score += norm_d * step if pixels + step < num_pixels else num_pixels - pixels
+            del_curve_raw.append(del_probs.mean().item())
 
-            # Insertion Score
+            # -- Insertion Score --
+            # Mask goes from 1 to 0 -> Image goes from Baseline to Original
             ins_image = phi_tensor(baseline_tensor, image_tensor, final_applied_mask).to(dtype=model.dtype)
             ins_probs = get_token_probs_tensor(args, model, full_ids, output_ids, ins_image, positions, is_qwen, video_grid_thw)
-            i_score = ins_probs.mean().item()
-            ins_curve.append(i_score)
-            norm_i = (i_score - blur_scores) / (og_scores - blur_scores + 1e-7)
-            ins_auc_score += norm_i * step if pixels + step < num_pixels else num_pixels - pixels
+            ins_curve_raw.append(ins_probs.mean().item())
             
-            index_curve.append((pixels + step) / num_pixels)
+            current_fraction = min((pixels + step) / num_pixels, 1.0)
+            fractions.append(current_fraction)
 
-        del_auc_score /= num_pixels
-        ins_auc_score /= num_pixels
+        # Standard Normalization with strict [0, 1] clamping
+        norm_del = np.clip((np.array(del_curve_raw) - prob_blur) / (prob_orig - prob_blur + 1e-7), 0.0, 1.0)
+        norm_ins = np.clip((np.array(ins_curve_raw) - prob_blur) / (prob_orig - prob_blur + 1e-7), 0.0, 1.0)
 
-    return ins_auc_score, del_auc_score, del_curve, ins_curve, index_curve
+        # Mathematical AUC integration via Trapezoidal rule
+        auc_del = np.trapezoid(norm_del, x=fractions)
+        auc_ins = np.trapezoid(norm_ins, x=fractions)
 
+    return auc_ins, auc_del, del_curve_raw, ins_curve_raw, fractions, prob_orig, prob_blur
+
+def save_video_heatmaps(final_mask, frames, target_H, target_W, outdir, ivd):
+    """
+    Upscales the final spatio-temporal mask and saves per-frame heatmaps.
+    frames: list of numpy arrays or PIL Images representing the original RGB video.
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    # 1. Get the actual dimensions of the original video frames
+    orig_H, orig_W = np.array(frames[0]).shape[:2]
+
+    # 2. Upscale the (T, 1, size, size) mask to the ORIGINAL video resolution
+    up_mask = F.interpolate(final_mask, size=(orig_H, orig_W), mode='bilinear', align_corners=False)
+    up_mask = up_mask.squeeze(1).cpu().detach().numpy() # Shape: (T, orig_H, orig_W)
+
+    # Global Min-Max Normalization across the whole sequence to maintain temporal relativity
+    mask_min = up_mask.min()
+    mask_max = up_mask.max()
+    up_mask = (up_mask - mask_min) / (mask_max - mask_min + 1e-7)
+
+    for t, mask_frame in enumerate(up_mask):
+        frame = np.array(frames[t]) # Convert PIL to NumPy if needed
+        
+        # Generate Jet Colormap
+        heatmap = cv2.applyColorMap(np.uint8(255 * mask_frame), cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) # Matplotlib expects RGB
+        heatmap = np.float32(heatmap) / 255.0
+        
+        frame_norm = np.float32(frame) / 255.0
+
+        # Overlay formula (50% heat, 50% original)
+        overlay = 0.5 * heatmap + 0.5 * frame_norm
+        overlay = np.clip(overlay, 0.0, 1.0)
+
+        # Save to disk
+        plt.imsave(os.path.join(outdir, f'{ivd}_frame_{t:03d}_heatmap.jpg'), heatmap)
+        plt.imsave(os.path.join(outdir, f'{ivd}_frame_{t:03d}_overlay.jpg'), overlay)
+    
 def run_igos(args, model, processor, full_ids, output_ids, frames, baseline_frames, positions, ivd):
     start = time.time()
     eprint("Running iGOS++ Frame-wise Optimization...")
@@ -334,20 +394,42 @@ def run_igos(args, model, processor, full_ids, output_ids, frames, baseline_fram
     )
     
     is_qwen = getattr(args, 'model', '') == 'qwen'
-    auc_ins, auc_del, del_curve, ins_curve, idx_curve = evaluate_auc_pixel_framewise(
+    
+    auc_ins, auc_del, del_curve, ins_curve, fractions, prob_orig, prob_blur = evaluate_auc_pixel_framewise(
         args, model, processor, full_ids, output_ids, final_mask, img_tensor, base_tensor, 
         positions, target_H, target_W, target_T, is_qwen, video_grid_thw, size=32
     )
     
+    plot_and_save_auc(
+        percentages=fractions, 
+        ins_curve=ins_curve, 
+        del_curve=del_curve, 
+        auc_ins=auc_ins, 
+        auc_del=auc_del, 
+        prob_orig=prob_orig, 
+        prob_blur=prob_blur, 
+        output_dir=args.output_dir, 
+        ivd=ivd
+    )
+
+    save_video_heatmaps(
+        final_mask=final_mask, 
+        frames=frames, 
+        target_H=target_H, 
+        target_W=target_W, 
+        outdir=os.path.join(args.output_dir, f"heatmaps_vid_{ivd}"), 
+        ivd=ivd
+    )
+
     eprint(f"iGOS++ Time: {(time.time() - start):.2f}s")
-   e print(f"AUC iGOS++ | Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
+    eprint(f"AUC iGOS++ | Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
     
     experiment_data = {
         "video_index": ivd,
         "AUC_Del": auc_del,
         "AUC_Ins": auc_ins
     }
-    os.makedirs(args.output_dir, exist_ok=True)
+    
     with open(os.path.join(args.output_dir, "igos_framewise_metrics.jsonl"), "a") as f:
         f.write(json.dumps(experiment_data) + "\n")
         
