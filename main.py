@@ -65,7 +65,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     )
 
     if getattr(args, 'method', '') == 'igos':
-        auc_ins, auc_del = run_igos(
+        auc_ins, auc_del, prob_orig, prob_blur = run_igos(
             args=args, 
             model=model, 
             processor=processor, 
@@ -76,11 +76,16 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
             positions=positions, 
             ivd=ivd
         )
-        return {
-            "auc_ins": auc_ins,
-            "auc_del": auc_del
-        }
 
+    return {
+            "auc_ins": auc_ins,
+            "auc_del": auc_del,
+            "prob_orig": prob_orig,
+            "prob_baseline_ins": prob_blur,
+            "prob_baseline_del": prob_blur, # iGOS uses the same baseline for both
+            "prob_ins": 0, # prob_orig,          # Dummy values to satisfy logging if it strictly requires them
+            "prob_del": 0 #prob_blur           # Dummy values
+        }
     eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
     
     # Unpack the unified mask outputs (Assuming process_video returns 3 items now: selected, scores, metrics)

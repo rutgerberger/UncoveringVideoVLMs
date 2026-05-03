@@ -16,8 +16,6 @@ import cv2
 import matplotlib.pyplot as plt
 
 from textwrap import fill
-
-
 from qwen_vl_utils import process_vision_info
 
 def eprint(*args, **kwargs):
@@ -32,7 +30,24 @@ def eprint(*args, **kwargs):
             wrapped_lines.append(fill(line, width=80))
     final_text = "\n".join(wrapped_lines)
     print(final_text, file=sys.stderr, **kwargs)
+
+def get_video_tensor_layout(tensor):
+    """
+    Dynamically infers the dimension layout of a 5D video tensor.
+    Returns a dict with indices for Time (T) and Channels (C).
+    """
+    shape = tensor.shape
+    if len(shape) != 5:
+        return None # Likely Qwen's flattened representation
     
+    # Check which dimension holds the 3 RGB channels
+    if shape[2] == 3 and shape[1] != 3:
+        return {'B': 0, 'T': 1, 'C': 2, 'H': 3, 'W': 4, 'format': 'BTC'}
+    elif shape[1] == 3 and shape[2] != 3:
+        return {'B': 0, 'C': 1, 'T': 2, 'H': 3, 'W': 4, 'format': 'BCT'}
+    else:
+        # Edge case (e.g., 3-frame video). Default to Hugging Face standard BTC.
+        return {'B': 0, 'T': 1, 'C': 2, 'H': 3, 'W': 4, 'format': 'BTC'}
 
 def exp_decay(init, iter, gamma=0.2):
     return init * math.exp(-gamma * iter)
@@ -63,9 +78,6 @@ def get_token_probs_tensor(args, model, full_ids, output_ids, pixel_values, posi
     return target_probs
 
 def process_vid_qwen(processor, frames, prompt=" ", apply_chat_template=False, fps=1.0, max_pixels=112896):
-    """
-    Universal wrapper for Qwen's vision processor to prevent feature/token mismatches.
-    """
     messages = [
         {"role": "user", "content": [
             {"type": "video", "video": frames, "fps": fps},
@@ -74,7 +86,6 @@ def process_vid_qwen(processor, frames, prompt=" ", apply_chat_template=False, f
     ]
     image_inputs, video_inputs = process_vision_info(messages)
     
-    # Only format with the <|im_start|> tags if we are explicitly asking for an answer
     if apply_chat_template:
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         text_inputs = [text]
@@ -95,16 +106,14 @@ def process_vid_qwen(processor, frames, prompt=" ", apply_chat_template=False, f
 def phi_tensor(img_tensor, baseline_tensor, mask):
     return img_tensor * mask + baseline_tensor * (1.0 - mask)
 
-def spatio_temporal_bilateral_tv(video, mask, tv_beta=2, sigma=0.01, lambda_t=0.5):
-    """
-    video: (T, C, H, W) or (1, T, C, H, W) or 2D flattened sequence (Qwen)
-    mask: (T, 1, size, size)
-    lambda_t: weight for temporal smoothness
-    """
-    # Squeeze batch dimension from video if present (e.g., 1, T, C, H, W -> T, C, H, W)
+def spatio_temporal_bilateral_tv(video, mask, layout=None, tv_beta=2, sigma=0.01, lambda_t=0.5):
+    # Squeeze batch dimension from video if present
     if video.dim() == 5 and video.shape[0] == 1:
         video = video.squeeze(0)
-        
+        # Force into standard (T, C, H, W) for edge calculations
+        if layout and layout['format'] == 'BCT':
+            video = video.permute(1, 0, 2, 3) 
+            
     if video.dim() == 4 and video.shape[1] == mask.shape[0]: 
         video = video.permute(1, 0, 2, 3)
         
@@ -113,7 +122,6 @@ def spatio_temporal_bilateral_tv(video, mask, tv_beta=2, sigma=0.01, lambda_t=0.
         dw_mask = torch.abs(mask[:, :, :, :-1] - mask[:, :, :, 1:]).pow(tv_beta)
         spatial_tv = torch.mean(dh_mask) + torch.mean(dw_mask)
         
-        # Temporal TV
         if mask.shape[0] > 1: 
             dt_mask = torch.abs(mask[:-1, :, :, :] - mask[1:, :, :, :]).pow(tv_beta)
             temporal_tv = torch.mean(dt_mask)
@@ -121,18 +129,16 @@ def spatio_temporal_bilateral_tv(video, mask, tv_beta=2, sigma=0.01, lambda_t=0.
             temporal_tv = 0.0
         return spatial_tv + (lambda_t * temporal_tv)
 
-    # Upscale mask to match video resolution for element-wise operations
     up_mask = F.interpolate(mask, size=(video.shape[-2], video.shape[-1]), mode='bilinear', align_corners=False)
     dh_mask = torch.abs(up_mask[:, :, :-1, :] - up_mask[:, :, 1:, :]).pow(tv_beta)
     dw_mask = torch.abs(up_mask[:, :, :, :-1] - up_mask[:, :, :, 1:]).pow(tv_beta)
-    # Extract edges from the video (for Bilateral weighting)
+    
     dh_img = torch.exp(-(video[:, :, :-1, :] - video[:, :, 1:, :]).mean(dim=1, keepdim=True)**2 / sigma)
     dw_img = torch.exp(-(video[:, :, :, :-1] - video[:, :, :, 1:]).mean(dim=1, keepdim=True)**2 / sigma)
     
     spatial_tv = torch.mean(dh_img * dh_mask) + torch.mean(dw_img * dw_mask)
 
-    # Temporal TV (T dimension) to prevent flickering
-    if up_mask.shape[0] > 1: # If T > 1
+    if up_mask.shape[0] > 1:
         dt_mask = torch.abs(up_mask[:-1, :, :, :] - up_mask[1:, :, :, :]).pow(tv_beta)
         dt_img = torch.exp(-(video[:-1, :, :, :] - video[1:, :, :, :]).mean(dim=1, keepdim=True)**2 / sigma)
         temporal_tv = torch.mean(dt_img * dt_mask)
@@ -141,32 +147,27 @@ def spatio_temporal_bilateral_tv(video, mask, tv_beta=2, sigma=0.01, lambda_t=0.
         
     return spatial_tv + (lambda_t * temporal_tv)
 
-def integrated_gradient_framewise(args, model, full_ids, output_ids, img_tensor, base_tensor, mask_input, num_iter, positions, target_H, target_W, target_T, is_qwen=False, video_grid_thw=None):
+def integrated_gradient_framewise(args, model, full_ids, output_ids, img_tensor, base_tensor, mask, num_iter, positions, target_H, target_W, target_T, is_qwen=False, video_grid_thw=None, layout=None):
     intervals = torch.linspace(1/num_iter, 1, num_iter, device=img_tensor.device).view(-1, 1, 1, 1, 1)
     total_loss = 0.0
     
     for alpha in intervals:
-        if isinstance(mask_input, tuple):
-            mask = mask_input[0] * mask_input[1]
-        else:
-            mask = mask_input
-        # Mask is (T, 1, size, size) -> Upscale to (T, 1, target_H, target_W)
         up_mask = F.interpolate(mask, size=(target_H, target_W), mode='bilinear', align_corners=False)
 
         if is_qwen:
-            # Qwen expects a flat sequence of patches (T * H * W, 1)
             interval_mask = up_mask.reshape(-1, 1) * alpha.view(1)
         else:
-            # Standard video expects (1, 1, T, H, W)
-            up_mask_5d = up_mask.permute(1, 0, 2, 3).unsqueeze(0) 
-            interval_mask = up_mask_5d * alpha
+            # Dynamic broadcasting fixes the dimension destruction bug
+            if layout and layout['format'] == 'BCT':
+                interval_mask = up_mask.permute(1, 0, 2, 3).unsqueeze(0) * alpha
+            else:
+                interval_mask = up_mask.unsqueeze(0) * alpha
             
         blended = phi_tensor(img_tensor, base_tensor, interval_mask)
         blended = blended + torch.randn_like(blended) * 0.2
         
         probs = get_token_probs_tensor(args, model, full_ids, output_ids, blended, positions, is_qwen=is_qwen, video_grid_thw=video_grid_thw)
         
-        # Optimize log-probs to prevent gradient saturation
         step_loss = torch.log(probs + 1e-7).sum() / num_iter
         step_loss.backward()
         total_loss += step_loss.item()
@@ -175,7 +176,7 @@ def integrated_gradient_framewise(args, model, full_ids, output_ids, img_tensor,
 
 def video_iGOS_pp(
         args, model, processor, full_ids, output_ids, frames, baseline_frames, positions,
-        size=32, iterations=15, ig_iter=6, L1=1, L2=1, L3=20, lr=10):
+        size=32, iterations=15, ig_iter=6, L1=1, L2=0.1, L3=10, lr=1000):
 
     is_qwen = getattr(args, 'model', '') == 'qwen'
 
@@ -184,90 +185,71 @@ def video_iGOS_pp(
         inputs_base = process_vid_qwen(processor, baseline_frames, prompt=" ", max_pixels=112896).to(model.device)
         video_grid_thw = inputs_orig['video_grid_thw']
         target_T, target_H, target_W = video_grid_thw[0][0].item(), video_grid_thw[0][1].item(), video_grid_thw[0][2].item()
+        layout = None
     else:
         inputs_orig = processor(text=" ", videos=frames, return_tensors="pt").to(model.device)
         inputs_base = processor(text=" ", videos=baseline_frames, return_tensors="pt").to(model.device)
         video_grid_thw = None
-        shape = inputs_orig['pixel_values_videos'].shape
-        target_H, target_W = shape[-2], shape[-1]
-        target_T = shape[2] if len(shape) == 5 else 1
+        pixel_values = inputs_orig['pixel_values_videos']
+        layout = get_video_tensor_layout(pixel_values)
+        
+        shape = pixel_values.shape
+        target_H, target_W = shape[layout['H']], shape[layout['W']]
+        target_T = shape[layout['T']]
 
     image = inputs_orig['pixel_values_videos'].to(dtype=model.dtype).detach()
     baseline = inputs_base['pixel_values_videos'].to(dtype=model.dtype).detach()
 
-    # Frame-wise initialization: (target_T, 1, size, size)
-    masks_del = Variable(torch.ones((target_T, 1, size, size), dtype=torch.float32, device=model.device), requires_grad=True)
-    masks_ins = Variable(torch.ones((target_T, 1, size, size), dtype=torch.float32, device=model.device), requires_grad=True)
+    # Single mask formulation as defined in Section 3.3
+    mask = Variable(torch.ones((target_T, 1, size, size), dtype=torch.float32, device=model.device), requires_grad=True)
+    cita = torch.zeros_like(mask).to(model.device)
 
-    cita_d = torch.zeros_like(masks_del).to(model.device)
-    cita_i = torch.zeros_like(masks_ins).to(model.device)
-
-    def regularization_loss(masks, current_L2):
-        loss_l1 = L1 * torch.mean(torch.abs(1 - masks).view(masks.shape[0], -1), dim=1)
-        loss_tv = L3 * spatio_temporal_bilateral_tv(image, masks)
-        loss_l2 = current_L2 * torch.sum((1 - masks)**2, dim=[1, 2, 3])
+    def regularization_loss(mask, current_L2):
+        loss_l1 = L1 * torch.mean(torch.abs(1 - mask).view(mask.shape[0], -1), dim=1)
+        loss_tv = L3 * spatio_temporal_bilateral_tv(image, mask, layout)
+        loss_l2 = current_L2 * torch.sum((1 - mask)**2, dim=[1, 2, 3])
         return loss_l1, loss_tv, loss_l2
 
     eprint("\nStarting video_iGOS++ Frame-wise Optimization...")
     for i in range(iterations):        
-    # Combined Deletion IG (Pass as a tuple)
-        loss_comb_del = integrated_gradient_framewise(args, model, full_ids, output_ids, image, baseline, (masks_del, masks_ins), ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
-        total_grads1 = masks_del.grad.clone() if masks_del.grad is not None else torch.zeros_like(masks_del)
-        total_grads2 = masks_ins.grad.clone() if masks_ins.grad is not None else torch.zeros_like(masks_ins)
-        if masks_del.grad is not None: masks_del.grad.zero_()
-        if masks_ins.grad is not None: masks_ins.grad.zero_()
+        total_grads = torch.zeros_like(mask)
+        
+        # Deletion
+        loss_del = integrated_gradient_framewise(args, model, full_ids, output_ids, image, baseline, mask, ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw, layout)
+        total_grads += mask.grad.clone()
+        mask.grad.zero_()
 
-        # Combined Insertion IG (Pass as a tuple)
-        loss_comb_ins = integrated_gradient_framewise(args, model, full_ids, output_ids, baseline, image, (masks_del, masks_ins), ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
-        total_grads1 -= masks_del.grad.clone()
-        total_grads2 -= masks_ins.grad.clone()
-        masks_del.grad.zero_()
-        masks_ins.grad.zero_()
+        # Insertion
+        loss_ins = integrated_gradient_framewise(args, model, full_ids, output_ids, baseline, image, mask, ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw, layout)
+        total_grads -= mask.grad.clone()
+        mask.grad.zero_()
 
-        # Individual Deletion IG (Pass normally)
-        loss_del = integrated_gradient_framewise(args, model, full_ids, output_ids, image, baseline, masks_del, ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
-        total_grads1 += masks_del.grad.clone()
-        masks_del.grad.zero_()
-
-        # Individual Insertion IG (Pass normally)
-        loss_ins = integrated_gradient_framewise(args, model, full_ids, output_ids, baseline, image, masks_ins, ig_iter, positions, target_H, target_W, target_T, is_qwen, video_grid_thw)
-        total_grads2 -= masks_ins.grad.clone()
-        masks_ins.grad.zero_()
-
-        total_grads1 /= 2
-        total_grads2 /= 2
-
-        # Regularization (Calculate it here since regularization uses a single backward pass)
-        comb_mask = masks_del * masks_ins
+        # Regularization
         current_L2 = exp_decay(L2, i, getattr(args, 'gamma', 0.2))
-        loss_l1, loss_tv, loss_l2_val = regularization_loss(comb_mask, current_L2)
+        loss_l1, loss_tv, loss_l2_val = regularization_loss(mask, current_L2)
         losses = loss_l1.sum() + loss_tv + loss_l2_val.sum()
         losses.backward()
         
-        total_grads1 += masks_del.grad.clone()
-        total_grads2 += masks_ins.grad.clone()
+        total_grads += mask.grad.clone()
 
         # Optimizer Step (NAG)
         momentum = getattr(args, 'momentum', 3)
         e = i / (i + momentum)
-        cita_d_p, cita_i_p = cita_d, cita_i
-        cita_d = masks_del.data - lr * total_grads1
-        cita_i = masks_ins.data - lr * total_grads2
-        masks_del.data = cita_d + e * (cita_d - cita_d_p)
-        masks_ins.data = cita_i + e * (cita_i - cita_i_p)
+        cita_p = cita
+        cita = mask.data - lr * total_grads
+        mask.data = cita + e * (cita - cita_p)
 
-        masks_del.grad.zero_()
-        masks_ins.grad.zero_()
-        masks_del.data.clamp_(0, 1)
-        masks_ins.data.clamp_(0, 1)
+        mask.grad.zero_()
+        mask.data.clamp_(0, 1)
 
         print(f"iGOS++ Iter: {i} | loss_del: {loss_del:.4f} | loss_ins: {loss_ins:.4f} | TV: {loss_tv.item():.4f}")
 
-    final_mask = masks_del * masks_ins
-    return final_mask, target_H, target_W, target_T, video_grid_thw, image, baseline
+    # Polarity Inversion: The optimizer drives the mask to 0 for important pixels.
+    # We must invert it back to a standard heatmap (1 = important) for AUC and drawing.
+    final_heatmap = 1.0 - mask
+    return final_heatmap, target_H, target_W, target_T, video_grid_thw, image, baseline, layout
 
 def plot_and_save_auc(percentages, ins_curve, del_curve, auc_ins, auc_del, prob_orig, prob_blur, output_dir, ivd):
-    """Handles matplotlib generation and disk I/O."""
     plt.figure(figsize=(8, 6))
     plt.plot(percentages, ins_curve, label=f'Insertion (AUC={auc_ins:.3f})', color='green', marker='o')
     plt.plot(percentages, del_curve, label=f'Deletion (AUC={auc_del:.3f})', color='red', marker='x')
@@ -284,12 +266,7 @@ def plot_and_save_auc(percentages, ins_curve, del_curve, auc_ins, auc_del, prob_
     plt.savefig(os.path.join(output_dir, f"{ivd}_auc_curves.png"))
     plt.close()
 
-
-def evaluate_auc_pixel_framewise(args, model, processor, full_ids, output_ids, final_mask, image_tensor, baseline_tensor, positions, target_H, target_W, target_T, is_qwen, video_grid_thw, size=32):
-    """
-    Evaluates AUC by globally sorting pixels across the entire Spatio-Temporal mask.
-    Mathematically aligned with iGOS++ and constrained to [0, 1].
-    """
+def evaluate_auc_pixel_framewise(args, model, processor, full_ids, output_ids, final_mask, image_tensor, baseline_tensor, positions, target_H, target_W, target_T, is_qwen, video_grid_thw, layout=None, size=32):
     with torch.no_grad():
         num_pixels = target_T * size * size
         step = max(1, num_pixels // 50) 
@@ -303,33 +280,30 @@ def evaluate_auc_pixel_framewise(args, model, processor, full_ids, output_ids, f
         del_curve_raw, ins_curve_raw = [prob_orig], [prob_blur]
         fractions = [0.0]
 
-        # true_mask starts as all 1s (determines the blend ratio)
         true_mask = torch.ones((1, num_pixels), device=model.device)
 
-        # Globally sort all pixels in the video (descending = highest gradients first)
+        # final_mask is now inverted (1 = important). Descending sorts the object pixels to the top.
         elements = torch.argsort(final_mask.view(1, -1), dim=1, descending=True)
 
         for pixels in range(0, num_pixels, step):
             indices = elements[:, pixels:pixels+step].squeeze(0)
-            true_mask[0, indices] = 0 # Mask out the most important pixels
+            true_mask[0, indices] = 0
 
-            # Reshape back to (T, 1, size, size) and upsample
             spatial_mask = true_mask.view(target_T, 1, size, size)
             up_mask = F.interpolate(spatial_mask, size=(target_H, target_W), mode='bilinear', align_corners=False)
             
             if is_qwen:
                 final_applied_mask = up_mask.reshape(-1, 1)
             else:
-                final_applied_mask = up_mask.permute(1, 0, 2, 3).unsqueeze(0)
+                if layout and layout['format'] == 'BCT':
+                    final_applied_mask = up_mask.permute(1, 0, 2, 3).unsqueeze(0)
+                else:
+                    final_applied_mask = up_mask.unsqueeze(0)
 
-            # -- Deletion Score --
-            # Mask goes from 1 to 0 -> Image goes from Original to Baseline
             del_image = phi_tensor(image_tensor, baseline_tensor, final_applied_mask).to(dtype=model.dtype)
             del_probs = get_token_probs_tensor(args, model, full_ids, output_ids, del_image, positions, is_qwen, video_grid_thw)
             del_curve_raw.append(del_probs.mean().item())
 
-            # -- Insertion Score --
-            # Mask goes from 1 to 0 -> Image goes from Baseline to Original
             ins_image = phi_tensor(baseline_tensor, image_tensor, final_applied_mask).to(dtype=model.dtype)
             ins_probs = get_token_probs_tensor(args, model, full_ids, output_ids, ins_image, positions, is_qwen, video_grid_thw)
             ins_curve_raw.append(ins_probs.mean().item())
@@ -337,50 +311,38 @@ def evaluate_auc_pixel_framewise(args, model, processor, full_ids, output_ids, f
             current_fraction = min((pixels + step) / num_pixels, 1.0)
             fractions.append(current_fraction)
 
-        # Standard Normalization with strict [0, 1] clamping
         norm_del = np.clip((np.array(del_curve_raw) - prob_blur) / (prob_orig - prob_blur + 1e-7), 0.0, 1.0)
         norm_ins = np.clip((np.array(ins_curve_raw) - prob_blur) / (prob_orig - prob_blur + 1e-7), 0.0, 1.0)
 
-        # Mathematical AUC integration via Trapezoidal rule
         auc_del = np.trapezoid(norm_del, x=fractions)
         auc_ins = np.trapezoid(norm_ins, x=fractions)
 
     return auc_ins, auc_del, del_curve_raw, ins_curve_raw, fractions, prob_orig, prob_blur
 
 def save_video_heatmaps(final_mask, frames, target_H, target_W, outdir, ivd):
-    """
-    Upscales the final spatio-temporal mask and saves per-frame heatmaps.
-    frames: list of numpy arrays or PIL Images representing the original RGB video.
-    """
     os.makedirs(outdir, exist_ok=True)
 
-    # 1. Get the actual dimensions of the original video frames
     orig_H, orig_W = np.array(frames[0]).shape[:2]
 
-    # 2. Upscale the (T, 1, size, size) mask to the ORIGINAL video resolution
     up_mask = F.interpolate(final_mask, size=(orig_H, orig_W), mode='bilinear', align_corners=False)
-    up_mask = up_mask.squeeze(1).cpu().detach().numpy() # Shape: (T, orig_H, orig_W)
+    up_mask = up_mask.squeeze(1).cpu().detach().numpy()
 
-    # Global Min-Max Normalization across the whole sequence to maintain temporal relativity
     mask_min = up_mask.min()
     mask_max = up_mask.max()
     up_mask = (up_mask - mask_min) / (mask_max - mask_min + 1e-7)
 
     for t, mask_frame in enumerate(up_mask):
-        frame = np.array(frames[t]) # Convert PIL to NumPy if needed
+        frame = np.array(frames[t])
         
-        # Generate Jet Colormap
         heatmap = cv2.applyColorMap(np.uint8(255 * mask_frame), cv2.COLORMAP_JET)
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) # Matplotlib expects RGB
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
         heatmap = np.float32(heatmap) / 255.0
         
         frame_norm = np.float32(frame) / 255.0
 
-        # Overlay formula (50% heat, 50% original)
         overlay = 0.5 * heatmap + 0.5 * frame_norm
         overlay = np.clip(overlay, 0.0, 1.0)
 
-        # Save to disk
         plt.imsave(os.path.join(outdir, f'{ivd}_frame_{t:03d}_heatmap.jpg'), heatmap)
         plt.imsave(os.path.join(outdir, f'{ivd}_frame_{t:03d}_overlay.jpg'), overlay)
     
@@ -388,16 +350,17 @@ def run_igos(args, model, processor, full_ids, output_ids, frames, baseline_fram
     start = time.time()
     eprint("Running iGOS++ Frame-wise Optimization...")
     
-    final_mask, target_H, target_W, target_T, video_grid_thw, img_tensor, base_tensor = video_iGOS_pp(
+    # Defaults strictly aligned with paper + single mask logic
+    final_mask, target_H, target_W, target_T, video_grid_thw, img_tensor, base_tensor, layout = video_iGOS_pp(
         args, model, processor, full_ids, output_ids, frames, baseline_frames, positions,
-        lr=10, L1=1, L2=1, L3=20, size=32, iterations=15, ig_iter=6
+        lr=10, L1=1, L2=0.1, L3=10, size=32, iterations=15, ig_iter=6
     )
     
     is_qwen = getattr(args, 'model', '') == 'qwen'
     
     auc_ins, auc_del, del_curve, ins_curve, fractions, prob_orig, prob_blur = evaluate_auc_pixel_framewise(
         args, model, processor, full_ids, output_ids, final_mask, img_tensor, base_tensor, 
-        positions, target_H, target_W, target_T, is_qwen, video_grid_thw, size=32
+        positions, target_H, target_W, target_T, is_qwen, video_grid_thw, layout=layout, size=32
     )
     
     plot_and_save_auc(
@@ -433,4 +396,4 @@ def run_igos(args, model, processor, full_ids, output_ids, frames, baseline_fram
     with open(os.path.join(args.output_dir, "igos_framewise_metrics.jsonl"), "a") as f:
         f.write(json.dumps(experiment_data) + "\n")
         
-    return auc_ins, auc_del
+    return auc_ins, auc_del, prob_orig, prob_blur
