@@ -25,7 +25,9 @@ def init_args():
     parser.add_argument('--mask_mode', type=str, default="joint", choices=["joint", "separate", "insertion", "deletion"])
     #Super cluster args (if hierarchical)
     parser.add_argument('--super_clusters', type=int, default=20)
-    parser.add_argument('--freeze_losers', type=lambda x: (str(x).lower() == 'true'), default=False)   
+    parser.add_argument('--freeze_losers', type=lambda x: (str(x).lower() == 'true'), default=False)
+    #Similarity Experiment
+    parser.add_argument('--k_fraction', type=int, default=0.25)
 
 
     parser.add_argument(

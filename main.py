@@ -96,7 +96,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions=positions, tokenizer=tokenizer)
     
     unique_tubes = np.unique(tubelets)
-    k_fraction = 0.25
+    k_fraction = getattr(args, 'k_fraction', 0.25)
     k_tubes = max(1, int(len(unique_tubes) * k_fraction))
 
     # Unified loop handles standard execution (run=1) and consistency checks (run=10) natively
