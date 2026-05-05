@@ -19,26 +19,29 @@ def eprint(*args, **kwargs):
     final_text = "\n".join(wrapped_lines)
     print(final_text, file=sys.stderr, **kwargs)
 
-
 def log_experiment(args, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
-                   prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, auc_ins, auc_del,
+                   prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, 
+                   auc_ins_mean, auc_del_mean, auc_ins_std, auc_del_std, iou_score, num_runs,
                    metrics, top_k, fmt_ins, fmt_del, fmt_merged, 
                    selected_ins, selected_del, selected_merged, unique_tubes, k_fraction, mode_name, start_time):
-
     """Handles single experiment logging"""
 
     os.makedirs(args.output_dir, exist_ok=True)
     metrics_file = os.path.join(args.output_dir, "frame_experiment_metrics.jsonl")
     experiment_data = {
         "video_index": ivd,
-        "num_frames": args.num_frames,
-        "Prob orig": round(prob_orig,3),
-        "Prob_baseline_del": round(prob_baseline_del,3),
-        "Prob_baseline_ins": round(prob_baseline_ins,3),
-        "Prob ins": round(prob_ins,3),
-        "Prob del": round(prob_del,3),
-        "AUC Ins": round(auc_ins,3),
-        "AUC Del": round(auc_del,3),
+        "num_frames": getattr(args, 'num_frames', 8),
+        "num_runs": num_runs,
+        "Prob orig": round(prob_orig, 3),
+        "Prob_baseline_del": round(prob_baseline_del, 3),
+        "Prob_baseline_ins": round(prob_baseline_ins, 3),
+        "Prob ins Mean": round(prob_ins, 3),
+        "Prob del Mean": round(prob_del, 3),
+        "AUC Ins Mean": round(auc_ins_mean, 3),
+        "AUC Ins Std": round(auc_ins_std, 3),
+        "AUC Del Mean": round(auc_del_mean, 3),
+        "AUC Del Std": round(auc_del_std, 3),
+        "IoU (Jaccard)": round(iou_score, 4),
         "metrics": metrics
     }
     
@@ -56,24 +59,21 @@ def log_experiment(args, log_func, ivd, question_text, ground_truth, model_answe
     log_func(f"baseline_ins probs: {prob_baseline_ins:.5f}\n")
 
     log_func(f"=== {mode_name} Tubelets Search Log ===")
-    log_func(f"Created tubelets and optimized weights in {(time.time() - start_time):.2f}s") # <-- Updated to start_time
+    log_func(f"Created tubelets and optimized weights in {(time.time() - start_time):.2f}s")
     log_func(f"Final Insertion tubelets (Top {top_k}): {fmt_ins} ({len(selected_ins)}/{len(unique_tubes)})")
     log_func(f"Final Deletion tubelets (Top {top_k}): {fmt_del} ({len(selected_del)}/{len(unique_tubes)})")
     log_func(f"Final Combined tubelets (Top {top_k}): {fmt_merged} ({len(selected_merged)}/{len(unique_tubes)})")
     log_func(f"Prob when Inserting Mask (top {k_fraction*100}%): {prob_ins:.5f} (Diff: {prob_orig - prob_ins:.5f})")
     log_func(f"Prob when Deleting Mask (top {k_fraction*100}%): {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
-    log_func(f"\nAUC Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
+    log_func(f"\nAUC Ins: {auc_ins_mean:.4f} ± {auc_ins_std:.4f} | Del: {auc_del_mean:.4f} ± {auc_del_std:.4f}")
     
-    # log_func(f"\n=== Experiment Metrics ===\n")
-    # log_func(f"Insertion Landscape -> d_eff: {insertion_metrics.get('d_eff', 0):.2f} | Diversity (L1): {insertion_metrics.get('diversity', 0):.4f} (from {insertion_metrics.get('num_top_candidates', 0)} top masks)")
-    # log_func(f"Deletion Landscape  -> d_eff: {deletion_metrics.get('d_eff', 0):.2f} | Diversity (L1): {deletion_metrics.get('diversity', 0):.4f} (from {deletion_metrics.get('num_top_candidates', 0)} top masks)")
-    # log_func(f"\nAUC Ins: {auc_ins:.4f} | Del: {auc_del:.4f}")
-
+    if num_runs > 1:
+        log_func(f"IoU (Jaccard Similarity) across {num_runs} runs: {iou_score:.4f}")
 
 def log_metrics(args, metrics, prefix=""):
     """dump experiment metrics in log file"""
         
-    with open(os.path.join(args.output_dir, f'{prefix}final_metrics.json'), 'w') as f: # <-- Appended prefix to filename to prevent overwrite
+    with open(os.path.join(args.output_dir, f'{prefix}final_metrics.json'), 'w') as f:
         p_orig = np.array([m['prob_orig'] for m in metrics])
         p_del = np.array([m['prob_del'] for m in metrics])
         p_b_del = np.array([m['prob_baseline_del'] for m in metrics])
@@ -89,6 +89,7 @@ def log_metrics(args, metrics, prefix=""):
         summary = {
             f"{prefix}avg_auc_ins": float(np.mean([m['auc_ins'] for m in metrics])),
             f"{prefix}avg_auc_del": float(np.mean([m['auc_del'] for m in metrics])),
+            f"{prefix}avg_iou_score": float(np.mean([m.get('iou_score', 1.0) for m in metrics])),
             f"{prefix}avg_prob_diff_del_topx": float(avg_prob_diff_del_topx),
             f"{prefix}avg_prob_diff_del_blur": float(avg_prob_diff_del_blur),
             f"{prefix}avg_prob_diff_ins_topx": float(avg_prob_diff_ins_topx),
