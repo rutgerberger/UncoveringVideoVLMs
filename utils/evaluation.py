@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 import numpy as np
-import matplotlib.pyplot as plot
+import matplotlib.pyplot as plt
 
 from itertools import combinations
 from PIL import Image
