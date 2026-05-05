@@ -11,7 +11,7 @@ from PIL import Image
 
 from utils.preprocessing import rescale_mask, create_super_tubelets, unpack_super_weights, get_baseline_insertion, get_baseline_deletion
 from utils.logging import eprint
-from utils.evaluation import tv_norm_3d, evaluate_fitness, evaluate_confidence
+from utils.evaluation import tv_norm_3d, evaluate_fitness, evaluate_confidence, jaccard_similarity
 from utils.model_utils import get_rescale_and_dummys, sigmoid, calculate_gradient
 from utils.visualization import visualize_gradients, visualize_heatmap, debug_save_pixels_interval
 
@@ -112,17 +112,16 @@ def CMA_ES(
     gen_best_fit = np.min(fitnesses)
     top_masks = [sigmoid(c) for i, c in enumerate(candidates) if fitnesses[i] <= gen_best_fit * 1.10]
     if len(top_masks) > 1:
-        dists = [np.mean(np.abs(top_masks[i] - top_masks[j])) 
-                 for i in range(len(top_masks)) for j in range(i + 1, len(top_masks))]
-        diversity = float(np.mean(dists))
+        # Calculate Jaccard similarity over the top 25% of tubelets within the population
+        population_jaccard = jaccard_similarity(top_masks, top_k_fraction=0.25)
     else:
-        diversity = 0.0
+        population_jaccard = 1.0 # 100% similarity if only one mask qualifies
 
     metrics = {
         "cma_evals": es.result.evaluations,
         "best_fitness": es.result.fbest,
         "d_eff": d_eff,
-        "diversity": diversity,
+        "population_jaccard": population_jaccard,
         "num_top_candidates": len(top_masks)
     }
     

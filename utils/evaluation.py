@@ -4,8 +4,9 @@ import math
 import torch
 import torch.nn.functional as F
 import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plot
 
+from itertools import combinations
 from PIL import Image
 from sklearn.metrics import auc
 
@@ -194,3 +195,40 @@ def evaluate_auc(args, model, processor, tokenizer, full_ids, output_ids, frames
     plot_and_save_auc(list(fractions), ins_curve_raw, del_curve_raw, auc_ins, auc_del, prob_orig, prob_blur, args.output_dir, ivd)
     
     return auc_ins, auc_del
+
+def jaccard_similarity(masks, top_k_fraction=0.25):
+    """
+    Calculates the average pairwise Jaccard similarity across a list of masks.
+    Extracts the top 25% tubelets for each mask before comparing.
+    """
+    if len(masks) < 2:
+        return 1.0
+
+    top_k_sets = []
+    
+    #First select the tob tubelets
+    for mask in masks:
+        # Handle numpy arrays (from CMA_ES candidates)
+        if isinstance(mask, (list, np.ndarray)):
+            num_tubes = len(mask)
+            k = max(1, int(num_tubes * top_k_fraction))
+            # Argsort returns ascending order, so we take the last k elements
+            top_tubes = set(np.argsort(mask)[-k:])
+        # Handle dictionaries (the final 'scores' dict returned by process_video)
+        elif isinstance(mask, dict):
+            num_tubes = len(mask)
+            k = max(1, int(num_tubes * top_k_fraction))
+            sorted_tubes = sorted(mask.keys(), key=lambda t: mask[t], reverse=True)
+            top_tubes = set(sorted_tubes[:k])
+        else:
+            raise TypeError("Mask must be a dictionary or array-like.")
+        top_k_sets.append(top_tubes)
+
+    # Calculate pairwise Jaccard similarity
+    jaccard_scores = []
+    for set1, set2 in combinations(top_k_sets, 2):
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        jaccard_scores.append(intersection / union if union > 0 else 0.0)
+
+    return float(np.mean(jaccard_scores))

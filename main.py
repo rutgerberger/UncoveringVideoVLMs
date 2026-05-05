@@ -48,6 +48,29 @@ def xai_method(args, model, tokenizer, processor, input_ids, output_ids, full_id
         )
 
 
+def similarity_experiment(args, model, tokenizer, processor, output_ids, full_ids, frames, tubelets, baseline_ins, baseline_del, positions=None, num_runs=10):
+    """
+    Runs the XAI optimization multiple times on the same input to test 
+    for problem well-posedness via Jaccard Similarity of the final masks.
+    """
+    eprint(f"\n[Experiment] Running consistency check over {num_runs} independent runs...")
+    all_scores = []
+
+    for i in range(num_runs):
+        eprint(f"\n--- Consistency Run {i+1}/{num_runs} ---")
+        np.random.seed(args.manual_seed + i) 
+        selected_tubes, scores, metrics = process_video(
+            args, model, tokenizer, processor, output_ids, full_ids, 
+            frames, tubelets, baseline_ins, baseline_del, positions=positions
+        )
+        eprint(f"{i+1} metrics: {metrics}")
+        all_scores.append(scores)
+
+    # Calculate final consistency using the top 25% of the resulting masks
+    similarity_score = jaccard_similarity(all_scores, top_k_fraction=0.25)
+    eprint(f"\n=== Similarity Experiment Results ===")
+    eprint(f"Final Pairwise Jaccard Similarity across {num_runs} runs: {similarity_score:.4f}")
+    return similarity_score
 
 def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets, 
                      baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, 
@@ -88,6 +111,16 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         }
     eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
     
+    if args.experiment == 'similarity':
+        similarity_score = similarity_experiment(
+                args, model, tokenizer, processor, output_ids, full_ids, 
+                frames, tubelets, baseline_ins_arr, baseline_del_arr, 
+                positions=None, num_runs=10
+        )
+        # Return uninformative metrics, not a matter of interest
+        return {"auc_ins": 0, "auc_del": 0, "prob_orig": 0, "prob_baseline_ins": 0,
+            "prob_baseline_del": 0, "prob_ins": 0, "prob_del": 0}
+
     # Unpack the unified mask outputs (Assuming process_video returns 3 items now: selected, scores, metrics)
     selected_tubes, scores, metrics = xai_method(
         args, model, tokenizer, processor, input_ids, output_ids, full_ids, frames, tubelets, 
