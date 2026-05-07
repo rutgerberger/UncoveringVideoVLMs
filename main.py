@@ -24,7 +24,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 eprint("Importing files 3/3...")
 
 from utils import *
-from optimizer import process_video, spix_gradient_iterative
+from optimizer import process_video
 from iGOS.igos_framewise import run_igos 
 from args import init_args
 
@@ -42,10 +42,7 @@ def xai_method(args, model, tokenizer, processor, input_ids, output_ids, full_id
             frames, tubelets, baseline_ins_arr, baseline_del_arr, positions=positions
         )
     else:
-        return spix_gradient_iterative(
-            args, model, tokenizer, processor, input_ids, output_ids, frames, tubelets,
-            positions=positions, max_stages=getattr(args, 'max_stages', 2), index=ivd
-        )
+        return 0
 
 def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets, 
                      baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, 
