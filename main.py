@@ -60,11 +60,17 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     )
 
     if getattr(args, 'method', '') == 'igos':
-        auc_ins, auc_del, prob_orig, prob_blur = run_igos(
-            args=args, model=model, processor=processor, full_ids=full_ids, 
-            output_ids=output_ids, frames=frames, baseline_frames=baseline_ins_frames, 
-            positions=positions, ivd=ivd
-        )
+        num_runs = 10 if getattr(args, 'experiment', '') == 'similarity' else 1
+        masks = []
+        for i in range(num_runs):
+            #TODO: fix iGOS mask stretching
+            mask, auc_ins, auc_del, prob_orig, prob_blur = run_igos(
+                args=args, model=model, processor=processor, full_ids=full_ids, 
+                output_ids=output_ids, frames=frames, baseline_frames=baseline_ins_frames, 
+                positions=positions, ivd=ivd
+            )
+            masks.append(mask)
+        jaccard_score = jaccard_similarity_pixel(masks, k_fraction=getattr(args, 'k_fraction', 0.1))
         return {
             "auc_ins": auc_ins,
             "auc_del": auc_del,
@@ -75,7 +81,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
             "prob_baseline_del": prob_blur, 
             "prob_ins": prob_orig, # Dummy fallback 
             "prob_del": prob_blur, # Dummy fallback 
-            "iou_score": 1.0       # Dummy fallback
+            "iou_score": jaccard_score
         }
         
     eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")

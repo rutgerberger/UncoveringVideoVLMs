@@ -232,3 +232,30 @@ def jaccard_similarity(masks, top_k_fraction=0.25):
         jaccard_scores.append(intersection / union if union > 0 else 0.0)
 
     return float(np.mean(jaccard_scores))
+
+def jaccard_similarity_pixel(masks, top_k_fraction=0.10):
+    """
+    Calculates the average pairwise Jaccard similarity across a list of masks.
+    Extracts the top k_fraction of pixels
+    masks: list of mask tensors (T, 1, H, W)
+    """
+    if len(masks) < 2:
+        return 1.0
+    with torch.no_grad():
+        jaccard_scores = []
+        binary_masks = []
+        for mask in masks:
+            flat_mask = mask.view(-1)
+            k = max(1, int(flat_mask.numel() * top_k_fraction)) #Threshold value
+            threshold = torch.topk(flat_mask, k).values[-1]
+            binarized = mask >= threshold #Binarized top-k
+            binary_masks.append(binarized)
+
+        for mask1, mask2 in combinations(binarized, 2):
+            intersection = torch.logical_and(mask1, mask2).sum().item()
+            union = torch.logical_or(mask1, mask2).sum().item()
+            if union > 0:
+                jaccard_scores.append(intersection / union)
+            else:
+                jaccard_scores.append(0.0)
+        return float(np.mean(jaccard_scores))

@@ -200,7 +200,6 @@ def video_iGOS_pp(
     image = inputs_orig['pixel_values_videos'].to(dtype=model.dtype).detach()
     baseline = inputs_base['pixel_values_videos'].to(dtype=model.dtype).detach()
 
-    # Single mask formulation as defined in Section 3.3
     mask = Variable(torch.ones((target_T, 1, size, size), dtype=torch.float32, device=model.device), requires_grad=True)
     cita = torch.zeros_like(mask).to(model.device)
 
@@ -396,4 +395,4 @@ def run_igos(args, model, processor, full_ids, output_ids, frames, baseline_fram
     with open(os.path.join(args.output_dir, "igos_framewise_metrics.jsonl"), "a") as f:
         f.write(json.dumps(experiment_data) + "\n")
         
-    return auc_ins, auc_del, prob_orig, prob_blur
+    return final_mask, auc_ins, auc_del, prob_orig, prob_blur
