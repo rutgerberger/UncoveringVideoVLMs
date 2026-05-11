@@ -19,6 +19,13 @@ def eprint(*args, **kwargs):
     final_text = "\n".join(wrapped_lines)
     print(final_text, file=sys.stderr, **kwargs)
 
+def log_frame_metrics(args, ivd, metrics):
+    os.makedirs(args.output_dir, exist_ok=True)
+    metrics_file = os.path.join(args.output_dir, "frame_experiment_metrics.jsonl")
+    with open(metrics_file, "a") as f:
+        f.write(json.dumps(metrics) + "\n")
+
+
 def log_experiment(args, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
                    prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, 
                    auc_ins_mean, auc_del_mean, auc_ins_std, auc_del_std, iou_score, num_runs,

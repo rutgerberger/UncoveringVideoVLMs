@@ -62,6 +62,8 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     if getattr(args, 'method', '') == 'igos':
         num_runs = 10 if getattr(args, 'experiment', '') == 'similarity' else 1
         masks = []
+        all_auc_ins = []
+        all_auc_del = []
         for i in range(num_runs):
             #TODO: fix iGOS mask stretching
             mask, auc_ins, auc_del, prob_orig, prob_blur = run_igos(
@@ -69,13 +71,19 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
                 output_ids=output_ids, frames=frames, baseline_frames=baseline_ins_frames, 
                 positions=positions, ivd=ivd
             )
+            all_auc_ins.append(auc_ins)
+            all_auc_del.append(auc_del)
             masks.append(mask)
-        jaccard_score = jaccard_similarity_pixel(masks, k_fraction=getattr(args, 'k_fraction', 0.1))
-        return {
-            "auc_ins": auc_ins,
-            "auc_del": auc_del,
-            "auc_ins_std": 0.0,
-            "auc_del_std": 0.0,
+        jaccard_score = jaccard_similarity_pixel(masks, top_k_fraction=getattr(args, 'k_fraction', 0.1))
+        avg_auc_ins, std_auc_ins = float(np.mean(all_auc_ins)), float(np.std(all_auc_ins)) if num_runs > 1 else 0.0
+        avg_auc_del, std_auc_del = float(np.mean(all_auc_del)), float(np.std(all_auc_del)) if num_runs > 1 else 0.0
+        eprint(f"iGOS jaccard score: {jaccard_score}")
+        metrics = {
+            "video_index": ivd,
+            "auc_ins": avg_auc_ins,
+            "auc_del": avg_auc_del,
+            "auc_ins_std": std_auc_ins,
+            "auc_del_std": std_auc_del,
             "prob_orig": prob_orig,
             "prob_baseline_ins": prob_blur,
             "prob_baseline_del": prob_blur, 
@@ -83,6 +91,8 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
             "prob_del": prob_blur, # Dummy fallback 
             "iou_score": jaccard_score
         }
+        log_frame_metrics(args, ivd, metrics)
+        return metrics
         
     eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
     
