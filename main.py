@@ -65,7 +65,6 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         all_auc_ins = []
         all_auc_del = []
         for i in range(num_runs):
-            #TODO: fix iGOS mask stretching
             mask, auc_ins, auc_del, prob_orig, prob_blur = run_igos(
                 args=args, model=model, processor=processor, full_ids=full_ids, 
                 output_ids=output_ids, frames=frames, baseline_frames=baseline_ins_frames, 
@@ -87,8 +86,8 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
             "prob_orig": prob_orig,
             "prob_baseline_ins": prob_blur,
             "prob_baseline_del": prob_blur, 
-            "prob_ins": prob_orig, # Dummy fallback 
-            "prob_del": prob_blur, # Dummy fallback 
+            "prob_ins": prob_orig, 
+            "prob_del": prob_blur, 
             "iou_score": jaccard_score
         }
         log_frame_metrics(args, ivd, metrics)
@@ -96,14 +95,14 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         
     eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
     
-    # Enable similarity loops if requested, else run standard single pass
     num_runs = 10 if getattr(args, 'experiment', '') == 'similarity' else 1
+    random_baseline_run = True if getattr(args, 'experiment', 'default') == 'random_baseline' else False
     
     all_scores, all_selected_tubes = [], []
     all_prob_ins, all_prob_del = [], []
     all_auc_ins, all_auc_del = [], []
+    all_infd = []
     
-    # Establish single-pass baseline probabilities
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions=positions, tokenizer=tokenizer)
     prob_baseline_del = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions=positions, tokenizer=tokenizer)
     prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions=positions, tokenizer=tokenizer)
@@ -112,7 +111,6 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     k_fraction = getattr(args, 'k_fraction', 0.25)
     k_tubes = max(1, int(len(unique_tubes) * k_fraction))
 
-    # Unified loop handles standard execution (run=1) and consistency checks (run=10) natively
     for run_idx in range(num_runs):
         if num_runs > 1:
             eprint(f"\n--- Consistency Run {run_idx+1}/{num_runs} ---")
@@ -122,12 +120,17 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         else:
             cur_file_prefix = file_prefix
 
-        selected_tubes, scores, metrics = xai_method(
-            args, model, tokenizer, processor, input_ids, output_ids, full_ids, frames, tubelets, 
-            baseline_ins_arr, baseline_del_arr, positions, ivd
-        )
+        if random_baseline_run:
+            eprint(f"Running randomized baseline ({mode_name} - Run {run_idx+1}).")
+            scores = {t: float(np.random.uniform(0, 1)) for t in unique_tubes}
+            selected_tubes = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
+            metrics = {"status": "randomized"}
+        else:
+            selected_tubes, scores, metrics = xai_method(
+                args, model, tokenizer, processor, input_ids, output_ids, full_ids, frames, tubelets, 
+                baseline_ins_arr, baseline_del_arr, positions, ivd
+            )
 
-        # Evaluation (calculating diffs when deleting/inserting max visual evidence)
         top_final = selected_tubes[:k_tubes]
         frames_ins = apply_universal_mask(video_array, baseline_ins_arr, tubelets, top_final)
         prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions=positions, tokenizer=tokenizer)
@@ -136,32 +139,35 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         frames_del = apply_universal_mask(video_array, baseline_del_arr, tubelets, keep_tubes_del)
         prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions=positions, tokenizer=tokenizer)
 
-        # Get AUC metrics specifically for this run's generated masks
         auc_ins, auc_del = evaluate_auc(
             args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, 
             selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_{cur_file_prefix}mask", positions=positions
         )
-        
+
+        infd = evaluate_infidelity(
+            args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, scores, positions=positions
+        )
+
         if getattr(args, 'save_visuals', True):
             eprint(f"Visualizing the Masked Tubelets ({mode_name} - Run {run_idx+1}).")
             keep_tubes_vis = [t for t in unique_tubes if t not in top_final]
             visualize_spix(video_array, baseline_del_arr, tubelets, keep_tubes_vis, os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}mask_cutout.gif"))
             visualize_heatmap(video_array, tubelets, scores, os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}highlight_mask.gif"))
 
-        # Collect state for aggregations
         all_scores.append(scores)
         all_selected_tubes.append(selected_tubes)
         all_prob_ins.append(prob_ins)
         all_prob_del.append(prob_del)
         all_auc_ins.append(auc_ins)
         all_auc_del.append(auc_del)
+        all_infd.append(infd)
 
     iou_score = jaccard_similarity(all_scores, top_k_fraction=k_fraction) if num_runs > 1 else 1.0
     avg_auc_ins, std_auc_ins = float(np.mean(all_auc_ins)), float(np.std(all_auc_ins)) if num_runs > 1 else 0.0
     avg_auc_del, std_auc_del = float(np.mean(all_auc_del)), float(np.std(all_auc_del)) if num_runs > 1 else 0.0
     avg_prob_ins, avg_prob_del = float(np.mean(all_prob_ins)), float(np.mean(all_prob_del))
+    avg_infd, std_infd = float(np.mean(all_infd)), float(np.std(all_infd)) if num_runs > 1 else 0.0
 
-    # Use the final run as a proxy for the string-formatted log dumps
     last_selected = all_selected_tubes[-1]
     last_scores = all_scores[-1]
     top_k = min(5, len(last_selected))
@@ -179,6 +185,8 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         "auc_del": avg_auc_del,
         "auc_ins_std": std_auc_ins,
         "auc_del_std": std_auc_del,
+        "infd": avg_infd,
+        "infd_std": std_infd,
         "prob_orig": prob_orig,
         "prob_baseline_del": prob_baseline_del,
         "prob_baseline_ins": prob_baseline_ins,
@@ -196,7 +204,6 @@ def explain_data(data, model, processor, args, tokenizer):
     param tokenizer: "  "  alongside the model
     for each datapoint, runs XAI pipeline
     """
-    # First we set up logging structure
     now = datetime.datetime.now() 
     setting = f'{now.month}{now.day}-{now.hour}{now.minute}'
     out_dir = os.path.join(args.output_dir, setting)
@@ -205,16 +212,16 @@ def explain_data(data, model, processor, args, tokenizer):
     with open(os.path.join(out_dir, 'args.json'), 'w') as f:
         json.dump(vars(args), f, indent=4)
     log_file = os.path.join(args.output_dir, "log.txt")
+    
     def log(msg):
         with open(log_file, "a") as f:
             f.write(str(msg) + "\n")
             
-    # For evaluation
     target_num_videos = min(len(data), args.num_videos) if args.num_videos > 0 else len(data)
     global_metrics = []
     global_gt_metrics = []
     
-    if args.randomize_data == True:
+    if args.randomize_data:
         random.shuffle(data)
 
     explained_count = 0
@@ -224,7 +231,6 @@ def explain_data(data, model, processor, args, tokenizer):
         eprint(f"\nProcessing target {explained_count+1}/{target_num_videos} (Row {ivd}): Retrieving data.")
         start = time.time()
 
-        #Load current question, frame and ground truth (if avail)
         try:
             frames, qs, cur_prompt, correct_idx = get_data(args, data[ivd])
             ground_truth_label = str(correct_idx)
@@ -232,14 +238,13 @@ def explain_data(data, model, processor, args, tokenizer):
         except Exception as e:
             eprint(f"Error loading row {ivd}: {e}")
             continue
+            
         eprint(f"Retrieved data in {time.time() - start:.2f}s")
 
-        #Get original answer of the model (with token IDs)
         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
         special_ids = [idx for idx in [tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id] if idx is not None]
         full_ids = torch.cat((input_ids, output_ids), dim=1)
 
-        #Obtain baseline videos (and save if desired)- we do it here once (saves time)
         eprint(f"{ivd+1}/{args.num_videos}: Creating Tubelets and Baseline Frames.")
         video_array, tubelets = generate_tubelets_optimized(frames, args)
         baseline_ins_arr = get_baseline_insertion(args, video_array)
@@ -252,11 +257,10 @@ def explain_data(data, model, processor, args, tokenizer):
             eprint("Visual evidence too little. Skipping video")
             continue
             
-        #Main pipeline
         metrics = explain_vid(
             args, model, processor, tokenizer, frames, video_array, tubelets, 
             baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, special_ids,
-            input_ids, output_ids, full_ids,qs, ground_truth_label, output_text, output_text, ivd, log, 
+            input_ids, output_ids, full_ids, qs, ground_truth_label, output_text, output_text, ivd, log, 
             mode_name="STANDARD", file_prefix=""
         )
 

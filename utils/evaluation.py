@@ -196,6 +196,65 @@ def evaluate_auc(args, model, processor, tokenizer, full_ids, output_ids, frames
     
     return auc_ins, auc_del
 
+
+def evaluate_infidelity(args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, scores, positions=None, num_samples=10, noise_scale=0.05):
+    """
+    Evaluates the Infidelity metric: INFD = E[(I^T M - (f(x) - f(x-I)))^2]
+    """
+    eprint("\n--- Starting Infidelity Evaluation ---")
+    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions, tokenizer)
+    
+    # Construct the dense explanation mask M from tubelet scores
+    T, H, W, C = video_array.shape
+    M = np.zeros((T, H, W), dtype=np.float32)
+    
+    # Normalize scores between 0 and 1 for numerical stability
+    max_score = max(scores.values()) if scores and len(scores) > 0 else 1.0
+    for t_id, score in scores.items():
+        M[tubelets == t_id] = score / (max_score + 1e-7)
+    
+    M_flat = M.reshape(-1)
+    infidelity_scores = []
+    
+    # Infidelity expectation loop over random noise perturbations
+    np.random.seed(getattr(args, 'manual_seed', 42))
+    for _ in range(num_samples):
+        # Generate random noise I (scaled to standard pixel space 0-255)
+        I = np.random.normal(loc=0.0, scale=noise_scale * 255.0, size=video_array.shape)
+        
+        # Compute x - I and clamp to valid uint8 image range
+        perturbed_video_array = np.clip(video_array - I, 0, 255).astype(np.uint8)
+        frames_perturbed = [Image.fromarray(frm) for frm in perturbed_video_array]
+        
+        # Model prediction on f(x - I)
+        prob_perturb = get_prob(args, model, processor, full_ids, output_ids, frames_perturbed, positions, tokenizer)
+        
+        # Actual model confidence drop
+        actual_diff = prob_orig - prob_perturb
+        
+        # Predicted drop: I^T M
+        # Average noise across RGB channels and normalize [0, 1] to match probability scale
+        I_intensity = np.mean(I, axis=-1) / 255.0 
+        I_flat = I_intensity.reshape(-1)
+        
+        predicted_diff = np.dot(I_flat, M_flat)
+        
+        # Scale predicted_diff to a probability space by dividing by the mask sum.
+        # This prevents I^T M from blowing up due to large resolution dimensions.
+        sum_M = np.sum(M_flat) + 1e-7
+        predicted_diff_scaled = predicted_diff / sum_M
+
+        sq_error = (predicted_diff_scaled - actual_diff) ** 2
+        infidelity_scores.append(sq_error)
+        
+    final_infidelity = float(np.mean(infidelity_scores))
+    eprint(f"Final Infidelity: {final_infidelity:.5f}")
+    
+    return final_infidelity
+
+
+
+
 def jaccard_similarity(masks, top_k_fraction=0.25):
     """
     Calculates the average pairwise Jaccard similarity across a list of masks.

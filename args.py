@@ -6,7 +6,7 @@ def init_args():
         description='Generate explanations for open-ended responses of LVLMs.'
     )
 
-    parser.add_argument('--experiment', type=str, default='default', choices=['default','similarity'])
+    parser.add_argument('--experiment', type=str, default='default', choices=['default','similarity','random_baseline'])
     #Hyperparams to the method
     parser.add_argument('--reg_lambda', type=float, default=1.0)
     parser.add_argument('--num_frames', type=int, default=12)
