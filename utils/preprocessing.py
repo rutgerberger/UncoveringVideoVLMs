@@ -334,14 +334,19 @@ def get_data(args, row):
         if video_path is None:
             video_path = os.path.join(args.video_folder, video_filename)
 
+        if 'questions' in row: #For categorized file
+            q_data = row['questions'][0] 
+        else:
+            q_data = row
+
         # Parse question data
-        q_data = row['questions'][0] # first question in the scene
         question_text = q_data['question']
         q_type = q_data.get('question_type', 'descriptive')
         options_prompt = ""
         
-        # Descriptive questions have a direct string answer
-        if q_type == 'descriptive' or 'choices' not in q_data:
+        # Descriptive questions have a direct string answer.
+        # We use `not q_data.get('choices')` to safely catch both missing keys and empty lists []
+        if q_type == 'descriptive' or not q_data.get('choices'):
             correct_idx = q_data.get('answer', '')
             cur_prompt = question_text
             qs = cur_prompt + "\nAnswer with as few words as possible."
