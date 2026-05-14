@@ -11,8 +11,8 @@ from PIL import Image
 
 from utils.preprocessing import rescale_mask, create_super_tubelets, unpack_super_weights, get_baseline_insertion, get_baseline_deletion
 from utils.logging import eprint
-from utils.evaluation import tv_norm_3d, evaluate_fitness, evaluate_confidence, jaccard_similarity
-from utils.model_utils import get_rescale_and_dummys, sigmoid, calculate_gradient
+from utils.evaluation import tv_norm_3d, evaluate_fitness, jaccard_similarity
+from utils.model_utils import get_rescale_and_dummys, sigmoid, get_vocab_stats
 from utils.visualization import visualize_gradients, visualize_heatmap, debug_save_pixels_interval
 
 SAVE_INTERMEDIATE_VISUALS = False
@@ -22,7 +22,8 @@ SAVE_INTERMEDIATE_VISUALS = False
 def CMA_ES(
         args, model, processor, tokenizer, full_ids, output_ids, 
         frames_orig, frames_base, tubelets, positions=None, mode='joint',
-        max_iters=None, initial_weights=None, active_tubes=None, popsize=None
+        max_iters=None, initial_weights=None, active_tubes=None, popsize=None,
+        vocab_stats=None
     ):
     """
     Performs Universal CMA-ES optimization
@@ -82,7 +83,7 @@ def CMA_ES(
             #Use these to evaluate the fitness
             fitness, score_del, score_ins = evaluate_fitness(
                 args, mode, M_scaled, M_vol, M_large, video, baseline, model, 
-                positions, full_ids, output_ids, dummy_inputs_orig
+                positions, full_ids, output_ids, dummy_inputs_orig, vocab_stats=vocab_stats
             )
             fitnesses.append(fitness)
             confidences.append((score_del, score_ins))
@@ -92,7 +93,7 @@ def CMA_ES(
         es.disp()
         
         best_del, best_ins = confidences[best_idx]
-        eprint(f"Gen {generation} | Best Fit: {fitnesses[best_idx]:.4f} | Conf (Del/Ins): {best_del:.4f} / {best_ins:.4f}")
+        eprint(f"Gen {generation} | Best Fit: {fitnesses[best_idx]:.4f} | Raw Scores (Del/Ins): {best_del:.4f} / {best_ins:.4f}")
         generation += 1
     
     W_best = es.result.xbest if es.result.xbest is not None else mean_init
@@ -135,7 +136,14 @@ def process_video(args, model, tokenizer, processor, output_ids, full_ids, frame
     frames_orig = [Image.fromarray(np.array(img).astype(np.uint8)) for img in frames]
     frames_del_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del]
     frames_ins_base = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins]
-    
+
+    # These scores are required for normalizing the target logits
+    # Which unbiases the optimization loop
+    vocab_mus, vocab_sigmas = get_vocab_stats(
+        args, model, processor, full_ids, output_ids, frames, positions
+    )
+    vocab_stats = (vocab_mus, vocab_sigmas)
+
     # Internal helper to handle Hierarchical vs Standard seamlessly for both objectives (joint vs separate)
     def run_cmaes_for_mode(opt_mode, base_frames):
         use_hierarchical = getattr(args, 'use_hierarchical', False)
@@ -146,7 +154,8 @@ def process_video(args, model, tokenizer, processor, output_ids, full_ids, frame
             eprint(f"\n=== Standard CMA-ES ({opt_mode.upper()}) ===")
             return CMA_ES(
                 args, model, processor, tokenizer, full_ids, output_ids, frames_orig, base_frames, 
-                tubelets, positions=positions, mode=opt_mode, max_iters=total_iters, popsize=popsize
+                tubelets, positions=positions, mode=opt_mode, max_iters=total_iters, popsize=popsize,
+                vocab_stats=vocab_stats
             )
 
         eprint(f"\n=== Hierarchical Stage 1: Coarse ({opt_mode.upper()}) ===")

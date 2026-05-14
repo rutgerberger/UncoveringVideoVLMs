@@ -14,7 +14,12 @@ from .logging import eprint
 
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
-    
+
+
+# ==========================================
+# Build original output & input
+# ==========================================
+
 def process_vid_qwen(processor, frames, prompt=" ", apply_chat_template=False, fps=1.0, max_pixels=112896):
     """
     Universal wrapper for Qwen's vision processor to prevent feature/token mismatches.
@@ -80,14 +85,26 @@ def get_model_response(args, model, processor, tokenizer, prompt, frames):
         return generate(args, model, tokenizer, inputs)
 
 
-def get_prob(args, model, processor, full_ids, output_ids, frames, positions=None, tokenizer=None):
-    """Calculates log probability of the output_ids; optionally filtered by positions."""
+# ==========================================
+# During optimization, we use optimized func.
+# to generate output & build input
+# ==========================================
 
-    if args.model == 'qwen':
+def _get_target_logits(model, forward_kwargs, output_ids):
+    """Executes the model and slices the logits for the output text."""
+    with torch.no_grad():
+        outputs = model(**forward_kwargs)
+    out_len = output_ids.shape[-1]
+    return outputs.logits[:, -out_len - 1 : -1, :]
+
+
+def _build_kwargs_processor(args, model, processor, full_ids, frames):
+    """Prepares model inputs using the Hugging Face processor."""
+
+    if getattr(args, 'model', '') == 'qwen':
         inputs = process_vid_qwen(processor, frames)
     else:
-        inputs = processor(text=" ", videos=frames, return_tensors="pt")
-    
+        inputs = processor(text=" ", videos=frames, return_tensors="pt")  
     pixel_values = inputs['pixel_values_videos'].to(model.device, dtype=model.dtype)
     if pixel_values.dim() == 4:
         pixel_values = pixel_values.unsqueeze(0)
@@ -100,35 +117,10 @@ def get_prob(args, model, processor, full_ids, output_ids, frames, positions=Non
     if 'video_grid_thw' in inputs:
         forward_kwargs['video_grid_thw'] = inputs['video_grid_thw'].to(model.device)
         
-    with torch.no_grad():
-        outputs = model(**forward_kwargs)
-    logits = outputs.logits  
-    out_len = output_ids.shape[-1] 
-    target_logits = logits[:, -out_len - 1 : -1, :] 
-    probs = F.softmax(target_logits, dim=-1) 
-    target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-    
-    #if positions is not None and len(positions) > 0:
-    #    decoded_targets = [tokenizer.decode(idx) for idx in output_ids[0]]
-    #    eprint("\n--- TOKEN ALIGNMENT SANITY CHECK ---")
-    #    for pos in positions:
-    #        token_str = decoded_targets[pos]
-    #        prob_val = target_probs[0, pos].item()
-    #        eprint(f"Position {pos} | Token: '{token_str}' | Extracted Prob: {prob_val:.4f}")
-    #    eprint("------------------------------------\n")
+    return forward_kwargs
 
-    if target_probs.dim() == 0:
-        target_probs = target_probs.unsqueeze(0)
-    if positions is not None and len(positions) > 0:
-        target_probs = target_probs[0, positions] 
-    return torch.log(target_probs + 1e-7).sum().item()
-    #sreturn target_probs.mean().item()
-
-def get_score_direct(vid_input, model, args, full_ids, output_ids, dummy_inputs_orig, positions=None):
-    """
-    Directly calculates the log-likelihood score from a raw video tensor,
-    bypassing the HuggingFace processor for maximum optimization loop performance.
-    """
+def _build_kwargs_direct(args, model, full_ids, vid_input, dummy_inputs_orig):
+    """Prepares model inputs directly from a tensor (bypassing the processor)."""
     forward_kwargs = {
         "input_ids": full_ids,
         "attention_mask": torch.ones_like(full_ids).to(model.device),
@@ -136,24 +128,84 @@ def get_score_direct(vid_input, model, args, full_ids, output_ids, dummy_inputs_
         "use_cache": False
     }
     
-    # Qwen requires explicit grid dimensions for its vision transformer
-    if getattr(args, 'model', '') == 'qwen':
-        forward_kwargs["video_grid_thw"] = dummy_inputs_orig["video_grid_thw"]
+    if getattr(args, 'model', '') == 'qwen' and dummy_inputs_orig is not None:
+        forward_kwargs["video_grid_thw"] = dummy_inputs_orig.get("video_grid_thw")
         
-    outputs = model(**forward_kwargs)
-    
-    # Extract the logits corresponding exactly to the target response tokens
-    out_len = output_ids.shape[-1]
-    target_logits = outputs.logits[:, -out_len - 1 : -1, :]
-    
-    probs = torch.nn.functional.softmax(target_logits, dim=-1)
-    target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-    
-    # Filter by visually relevant tokens (if provided)
+    return forward_kwargs
+
+
+# ==========================================
+# Processing based on positions
+# ==========================================
+
+def _gather_and_filter(tensor, output_ids, positions=None):
+    """Gathers values for specific output_ids and optionally filters by positions."""
+    gathered = tensor.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+    if gathered.dim() == 0:
+        gathered = gathered.unsqueeze(0)
     if positions is not None and len(positions) > 0:
-        target_probs = target_probs[0, positions]
-        
+        gathered = gathered[0, positions]
+    return gathered
+
+
+# ==========================================
+# Public Functions 
+# ==========================================
+
+def get_logits(args, model, processor, full_ids, output_ids, frames):
+    """Returns the raw output logit scores (full distribution) of the model."""
+    kwargs = _build_kwargs_processor(args, model, processor, full_ids, frames)
+    return _get_target_logits(model, kwargs, output_ids)
+
+
+def get_log_prob(args, model, processor, full_ids, output_ids, frames, positions=None, tokenizer=None):
+    """Calculates log probability of the output_ids; optionally filtered by positions."""
+    target_logits = get_logits(args, model, processor, full_ids, output_ids, frames)
+    probs = F.softmax(target_logits, dim=-1) 
+    target_probs = _gather_and_filter(probs, output_ids, positions)
     return torch.log(target_probs + 1e-7).sum().item()
+
+
+def get_prob_array(args, model, processor, full_ids, output_ids, frames, positions=None):
+    """Returns an array of probability scores for the output_ids; optionally filtered by positions."""
+    target_logits = get_logits(args, model, processor, full_ids, output_ids, frames)
+    probs = F.softmax(target_logits, dim=-1)
+    return _gather_and_filter(probs, output_ids, positions)
+
+
+def get_vocab_stats(args, model, processor, full_ids, output_ids, frames, positions):
+    """
+    Returns the mean (mu) and standard deviation (sigma) of the entire 
+    vocabulary distribution for the specified target positions.
+    """
+    full_logits = get_logits(args, model, processor, full_ids, output_ids, frames)
+    if positions is not None and len(positions) > 0:
+        full_logits = full_logits[:, positions, :]
+    # Calculate statistics across the vocab dimension (dim=-1)
+    mus = full_logits.mean(dim=-1).squeeze(0)   # Shape: [len(positions)]
+    sigmas = full_logits.std(dim=-1).squeeze(0) # Shape: [len(positions)]
+
+    return mus, sigmas
+
+
+def get_score_direct(vid_input, model, args, full_ids, output_ids, dummy_inputs_orig, positions=None, vocab_stats=None):
+    """
+    Directly calculates the Z-scored raw logit fitness from a video tensor,
+    bypassing the processor and avoiding Softmax squashing.
+    """
+    kwargs = _build_kwargs_direct(args, model, full_ids, vid_input, dummy_inputs_orig)
+    target_logits = _get_target_logits(model, kwargs, output_ids)
+    raw_token_logits = _gather_and_filter(target_logits, output_ids, positions)
+    if vocab_stats is not None:
+        mus, sigmas = vocab_stats
+        # Ensure tensors are on the same device
+        mus = mus.to(raw_token_logits.device)
+        sigmas = sigmas.to(raw_token_logits.device)
+        # Z = (X - mu) / sigma
+        z_scores = (raw_token_logits - mus) / (sigmas + 1e-7)
+        return z_scores.sum().item()
+    return raw_token_logits.sum().item() #fallback
+
 
 def get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, tubelets):
     """
@@ -198,42 +250,6 @@ def get_rescale_and_dummys(model, processor, frames, baseline_frames, is_qwen, t
     return dummy_inputs_orig, pixels_orig, pixels_base, target_T, target_H, target_W, t_dim_index, crop_top, crop_left, new_H, new_W, T_orig, H_orig, W_orig
 
 
-
-def get_token_probs(args, model, processor, full_ids, output_ids, frames):
-    """
-    Returns token probabilities of specified IDs (helper for find keywords)
-    """
-    if args.model == 'qwen':
-        inputs = process_vid_qwen(processor, frames)
-    else:
-        inputs = processor(text=" ", videos=frames, return_tensors="pt")        
-    pixel_values = inputs['pixel_values_videos'].to(model.device, dtype=model.dtype)
-    if pixel_values.dim() == 4:
-        pixel_values = pixel_values.unsqueeze(0)
-        
-    forward_kwargs = {
-        "input_ids": full_ids,
-        "attention_mask": torch.ones_like(full_ids).to(model.device),
-        "pixel_values_videos": pixel_values,
-        "use_cache": True
-    }
-    if 'video_grid_thw' in inputs:
-        forward_kwargs['video_grid_thw'] = inputs['video_grid_thw'].to(model.device)
-        
-    with torch.no_grad():
-        outputs = model(**forward_kwargs)
-        
-    logits = outputs.logits 
-    out_len = output_ids.shape[-1]
-    target_logits = logits[:, -out_len - 1 : -1, :] 
-    probs = F.softmax(target_logits, dim=-1) 
-    target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-    
-    if target_probs.dim() == 0:
-        target_probs = target_probs.unsqueeze(0)
-    return target_probs.squeeze(0) 
-
-
 def find_keywords(args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, output_text, tokenizer=None, use_yake=False, special_ids=None):
     """
     Finds the words that change mostly when comparing to a baseline video.
@@ -266,14 +282,15 @@ def find_keywords(args, model, processor, input_ids, output_ids, frames, baselin
             keywords = []
             for kw in kw_strings:
                 kw_ids = tokenizer.encode(kw, add_special_tokens=False)
-                matched_pos = match_keywords(output_ids[0].tolist(), kw_ids)
+                matched_pos = match_keywords(output_ids[0].tolist(), kw_ids) # Assuming this is a helper you have
                 if matched_pos:
                     positions.extend(matched_pos)
                     keywords.extend([tokenizer.decode(output_ids[0][p]).strip() for p in matched_pos])
         else:
-            full_prompt = torch.cat((input_ids, output_ids), dim=1)
-            probs = get_token_probs(args, model, processor, full_prompt, output_ids, frames)
-            probs_blur = get_token_probs(args, model, processor, full_prompt, output_ids, baseline_ins_frames)
+            full_ids = torch.cat((input_ids, output_ids), dim=1)
+            
+            probs = get_prob_array(args, model, processor, full_ids, output_ids, frames).squeeze(0)
+            probs_blur = get_prob_array(args, model, processor, full_ids, output_ids, baseline_ins_frames).squeeze(0)
             
             eps = 1e-7
             probs_safe = torch.clamp(probs, min=eps)
@@ -288,55 +305,3 @@ def find_keywords(args, model, processor, input_ids, output_ids, frames, baselin
             keywords = [tokenizer.decode(output_ids[0][idx]).strip() for idx in positions]
             
     return positions, keywords
-
-    
-def calculate_gradient(model, tokenizer, W_raw, pixels_interval, full_ids, 
-                        output_ids, positions, mode, args, 
-                        is_qwen, dummy_inputs_orig):
-    """
-    Calculates the gradients of each weight of the tubelets.
-    Returns the raw accumulated gradient so the main loop can calculate independent steps.
-    """
-    # Feed to model
-    forward_kwargs = {
-        "input_ids": full_ids,
-        "attention_mask": torch.ones_like(full_ids).to(model.device), 
-        "pixel_values_videos": pixels_interval.to(dtype=model.dtype),
-        "use_cache": False
-    }
-    if is_qwen:
-        forward_kwargs["video_grid_thw"] = dummy_inputs_orig["video_grid_thw"]
-    
-    outputs = model(**forward_kwargs)
-    
-    #-- Define the objective probabilities
-    logits = outputs.logits
-    out_len = output_ids.shape[-1]
-    target_logits = logits[:, -out_len - 1 : -1, :]
-    
-    predicted_ids = torch.argmax(target_logits[:, 0:1, :], dim=-1)
-    predicted_text = tokenizer.decode(predicted_ids[0], skip_special_tokens=True)
-    target_text = tokenizer.decode(output_ids[0], skip_special_tokens=True) # Assuming batch is 1
-    
-    probs = F.softmax(target_logits, dim=-1) 
-    target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-    if positions is not None and len(positions) > 0:
-        target_probs = target_probs[0, positions] 
-    mean_prob = target_probs.mean()
-    mean_prob_val = mean_prob.item()
-    log_prob = torch.log(mean_prob + 1e-7) 
-    
-    #-- Objective is dependend on the mode
-    if mode == 'deletion':
-        main_loss = log_prob / args.ig_steps 
-    else:
-        main_loss = -log_prob / args.ig_steps 
-    main_loss.backward()
-    
-    raw_accumulated_grads = W_raw.grad.detach().cpu().numpy()
-    
-    del outputs, logits, target_logits, probs, target_probs, main_loss
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    return predicted_text, target_text, raw_accumulated_grads.copy(), mean_prob_val

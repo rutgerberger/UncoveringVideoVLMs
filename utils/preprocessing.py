@@ -239,6 +239,28 @@ def apply_universal_mask(foreground_array, background_array, tubelets, active_tu
     masked_array = np.where(mask, foreground_array, background_array).astype(np.uint8)
     return [Image.fromarray(f) for f in masked_array]
 
+def apply_continuous_mask(video_array, baseline_array, tubelets, scores):
+    """
+    Applies a soft (continuous) mask to the video based on CMA-ES scores [0, 1].
+    Where score is 1.0, shows original video. Where score is 0.0, shows baseline.
+    """
+    max_id = tubelets.max()
+    score_map = np.zeros(max_id + 1, dtype=np.float32)
+    
+    # Map the scores to an array
+    for tid, score in scores.items():
+        score_map[tid] = np.clip(score, 0.0, 1.0)
+        
+    # Project the 1D scores onto the 3D tubelet grid and add a channel dimension
+    mask_3d = score_map[tubelets][..., np.newaxis]
+    
+    # Smoothly blend the original video and the baseline
+    blended = (video_array * mask_3d) + (baseline_array * (1.0 - mask_3d))
+    
+    # Ensure valid pixel range and convert to PIL
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
+    return [Image.fromarray(f) for f in blended]
+
 def create_super_tubelets(video_array, tubelets, n_clusters=12, mode='spatial'):
     """
     Clusters N tubelets into K super-tubelets.

@@ -5,20 +5,21 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+import scipy.stats as stats
 
 from itertools import combinations
 from PIL import Image
 from sklearn.metrics import auc
 
 from .logging import eprint
-from .model_utils import get_prob, get_score_direct
-from .preprocessing import get_baseline_deletion, get_baseline_insertion
+from .model_utils import get_log_prob, get_score_direct
+from .preprocessing import get_baseline_deletion, get_baseline_insertion, apply_universal_mask
 
 
 
 def get_prob_drop(args, model, processor, full_ids, baseline_ins_frames, output_ids, frames, tokenizer):
-    log_prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, tokenizer=tokenizer)
-    log_prob_baseline = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, tokenizer=tokenizer)
+    log_prob_orig = get_log_prob(args, model, processor, full_ids, output_ids, frames, tokenizer=tokenizer)
+    log_prob_baseline = get_log_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, tokenizer=tokenizer)
     # Calculate the actual probability ratio: e^(log_baseline - log_orig)
     prob_ratio = math.exp(log_prob_baseline - log_prob_orig)
     prob_drop = 1.0 - prob_ratio
@@ -38,20 +39,21 @@ def tv_norm_3d(mask, tv_beta=2):
 
 
 def evaluate_fitness(
-    args, mode, M_scaled, M_vol, M_large, video, baseline, model, positions, full_ids, output_ids, dummy_inputs_orig
-):
+        args, mode, M_scaled, M_vol, M_large, video, baseline, model, positions, full_ids, output_ids, dummy_inputs_orig,
+        vocab_stats=None
+    ):
     # M_scaled is the ratio of original video to keep.
     # For both deletion and insertion, this is exactly the same base formula.
     video_blended = video * M_scaled + baseline * (1.0 - M_scaled)
 
-    with torch.no_grad():
-        score = get_score_direct(video_blended, model, args, full_ids, output_ids, dummy_inputs_orig, positions)
+    with torch.no_grad(): # Calculate the log-likelihood score from the blended tensor
+        score = get_score_direct(video_blended, model, args, full_ids, output_ids, dummy_inputs_orig, positions, vocab_stats=vocab_stats)
 
     # For joint optimization, we also need to test the exact inverse mask 
     if mode == 'joint':
         video_inverse = baseline * M_scaled + video * (1.0 - M_scaled)
         with torch.no_grad():
-            score_inv = get_score_direct(video_inverse, model, args, full_ids, output_ids, dummy_inputs_orig, positions)
+            score_inv = get_score_direct(video_inverse, model, args, full_ids, output_ids, dummy_inputs_orig, positions, vocab_stats=vocab_stats)
         score_del, score_ins = score, score_inv
     else:
         score_del = score if mode == 'deletion' else 0.0
@@ -79,43 +81,6 @@ def evaluate_fitness(
     return float(fitness), score_del, score_ins
 
 
-
-def evaluate_confidence(model, processor, frames, input_ids, output_ids, is_qwen):
-    """
-    Evaluates the model's probability for the target output_ids.
-    Returns the decoded prediction and the probability score.
-    """
-    with torch.no_grad():
-        if is_qwen:
-            inputs = processor(text=[" "], videos=[frames], padding=True, return_tensors="pt", max_pixels=112896).to(model.device)
-            forward_kwargs = {
-                "input_ids": torch.cat((input_ids, output_ids), dim=1),
-                "attention_mask": torch.ones_like(torch.cat((input_ids, output_ids), dim=1)).to(model.device),
-                "pixel_values_videos": inputs['pixel_values_videos'].to(dtype=model.dtype),
-                "video_grid_thw": inputs['video_grid_thw'],
-                "use_cache": False
-            }
-        else:
-            inputs = processor(text=" ", videos=frames, return_tensors="pt").to(model.device)
-            forward_kwargs = {
-                "input_ids": torch.cat((input_ids, output_ids), dim=1),
-                "attention_mask": torch.ones_like(torch.cat((input_ids, output_ids), dim=1)).to(model.device),
-                "pixel_values_videos": inputs['pixel_values_videos'].to(dtype=model.dtype),
-                "use_cache": False
-            }
-        outputs = model(**forward_kwargs)
-        logits = outputs.logits
-        out_len = output_ids.shape[-1]
-        target_logits = logits[:, -out_len - 1 : -1, :]
-        predicted_ids = torch.argmax(target_logits[:, 0:1, :], dim=-1) #Mmhhh.. what is this?
-        probs = F.softmax(target_logits, dim=-1)
-        target_probs = probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-        mean_prob = target_probs.mean().item()
-        entropy = -torch.sum(probs * torch.log(probs + 1e-7), dim=-1)
-        mean_entropy = entropy.mean().item()
-    return predicted_ids, mean_prob, mean_entropy
-
-
 def plot_and_save_auc(percentages, ins_curve, del_curve, auc_ins, auc_del, prob_orig, prob_blur, output_dir, ivd):
     """Handles matplotlib generation and disk I/O."""
     plt.figure(figsize=(8, 6))
@@ -141,9 +106,9 @@ def evaluate_auc(args, model, processor, tokenizer, full_ids, output_ids, frames
     baseline_ins_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins_arr]
     baseline_del_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del_arr]
     
-    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions, tokenizer)
-    prob_blur = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions, tokenizer)
-    prob_del_base = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions, tokenizer)
+    prob_orig = get_log_prob(args, model, processor, full_ids, output_ids, frames, positions, tokenizer)
+    prob_blur = get_log_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions, tokenizer)
+    prob_del_base = get_log_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions, tokenizer)
     
     # Rank the pixels (Higher value = More Important)
     pixel_ranks = np.zeros((T, H, W), dtype=np.float32)
@@ -172,14 +137,14 @@ def evaluate_auc(args, model, processor, tokenizer, full_ids, output_ids, frames
         # f=0: Original video. f=1: Baseline masked video.
         del_array = np.where(mask_expanded, baseline_del_arr, video_array).astype(np.uint8)
         frames_del = [Image.fromarray(frm) for frm in del_array]
-        p_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions, tokenizer)
+        p_del = get_log_prob(args, model, processor, full_ids, output_ids, frames_del, positions, tokenizer)
         del_curve_raw.append(p_del)
 
         # -- Insertion --
         # f=0: Baseline blurred video. f=1: Original video.
         ins_array = np.where(mask_expanded, video_array, baseline_ins_arr).astype(np.uint8)
         frames_ins = [Image.fromarray(frm) for frm in ins_array]
-        p_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions, tokenizer)
+        p_ins = get_log_prob(args, model, processor, full_ids, output_ids, frames_ins, positions, tokenizer)
         ins_curve_raw.append(p_ins)
 
     # Standard XAI Metric Normalization (Clamped to prevent > 1.0 anomalies)
@@ -196,135 +161,78 @@ def evaluate_auc(args, model, processor, tokenizer, full_ids, output_ids, frames
     
     return auc_ins, auc_del
 
-def evaluate_infidelity(args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, scores, baseline_del_arr, positions=None, num_samples=15, max_masking_fraction=0.5):
+
+def calculate_faithfulness(all_prob_orig, all_prob_del):
     """
-    Evaluates the Infidelity metric by perturbing semantic tubelets 
-    (blending them toward the baseline) rather than injecting pixel-wise Gaussian noise.
+    Calculates Faithfulness metric over all samples. Min/max normalization is based on
+    the min and max log prob over the dataset. Expects lists or 1D arrays of log-probs
+    for the entire dataset (N samples).
     """
-    from utils.logging import eprint
-    eprint("\n--- Starting Infidelity Evaluation (Tubelet-Level) ---")
+    orig_np = np.array(all_prob_orig)
+    del_np = np.array(all_prob_del)
+    all_probs = np.concatenate([orig_np, del_np])
+    f_max = np.max(all_probs)
+    f_min = np.min(all_probs)
     
-    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions, tokenizer)
+    # Edge case: prevent division by zero
+    if f_max == f_min:
+        return 1.0
+    eprint(f"f_max {f_max} f_min {f_min}")
+    eprint(f"orig_prob {orig_np} del_prob {del_np}")
+    #Normalization
+    orig_norm = (orig_np - f_min) / (f_max - f_min)
+    del_norm = (del_np - f_min) / (f_max - f_min)
+    eprint(f"orig_norm {orig_norm} del_norm {del_norm}")
+    #Calculate final faithfulness
+    mean_diff = np.abs(orig_norm - del_norm).mean()
+    faithfulness = 1.0 - mean_diff
     
-    T, H, W, C = video_array.shape
-    unique_tubes = np.unique(tubelets)
-    num_tubes = len(unique_tubes)
-    
-    # 1. Construct the Explanation Vector (Phi)
-    # We align the scores in a fixed array corresponding to unique_tubes
-    Phi = np.array([scores.get(t, 0.0) for t in unique_tubes], dtype=np.float32)
-    
-    predicted_diffs_raw = []
-    actual_diffs = []
-    
-    np.random.seed(getattr(args, 'manual_seed', 42))
-    
-    for _ in range(num_samples):
-        # 2. Generate Tubelet Perturbations (I)
-        # For each tubelet, pick a random masking intensity between 0 and max_masking_fraction.
-        # I_k = 1.0 means the tubelet is completely replaced by the baseline.
-        # I_k = 0.0 means the tubelet remains completely original.
-        I_vector = np.random.uniform(0.0, max_masking_fraction, size=num_tubes)
-        
-        # 3. Map the tubelet perturbation values to the video's spatial dimensions
-        I_spatial = np.zeros((T, H, W), dtype=np.float32)
-        for idx, t_id in enumerate(unique_tubes):
-            I_spatial[tubelets == t_id] = I_vector[idx]
-            
-        I_spatial_expanded = I_spatial[..., np.newaxis] # Shape: (T, H, W, 1)
-        
-        # 4. Create the Perturbed Video
-        # Blend the original video with the baseline based on the I_vector multipliers
-        perturbed_video_array = ((1.0 - I_spatial_expanded) * video_array + 
-                                 I_spatial_expanded * baseline_del_arr).astype(np.uint8)
-                                 
-        frames_perturbed = [Image.fromarray(frm) for frm in perturbed_video_array]
-        
-        # 5. Get the actual model probability drop
-        prob_perturb = get_prob(args, model, processor, full_ids, output_ids, frames_perturbed, positions, tokenizer)
-        actual_diff = prob_orig - prob_perturb
-        
-        # 6. Get the explanation's predicted probability drop
-        # This is exactly I^T * Phi (dot product of perturbation vector and score vector)
-        predicted_diff_raw = np.dot(I_vector, Phi)
-        
-        predicted_diffs_raw.append(predicted_diff_raw)
-        actual_diffs.append(actual_diff)
+    return float(faithfulness)
 
-    predicted_diffs_raw = np.array(predicted_diffs_raw)
-    actual_diffs = np.array(actual_diffs)
+def calculate_monotonicity(args, model, processor, tokenizer, full_ids, output_ids, 
+                           frames, video_array, tubelets, baseline_del_arr, 
+                           ranked_tubelets, positions):
+    """
+    Calculates Monotonicity (Kendall's tau) by masking out increasing fractions 
+    of the most important tubelets.
+    """
+    # 1. Define the masking ratios (e.g., 10%, 20%, ... 90%)
+    ratios = np.linspace(0.1, 0.9, num=9)
+    num_unique_tubes = len(np.unique(tubelets))
     
-    # 7. Calculate Optimal Scaling Factor c*
-    # This securely maps the arbitrary scale of your CMA-ES weights into the model's actual probability scale
-    numerator = np.mean(predicted_diffs_raw * actual_diffs)
-    denominator = np.mean(predicted_diffs_raw ** 2) + 1e-8
-    c_star = numerator / denominator
+    # 2. Get the baseline prediction (0% masked)
+    # Convert log-prob to true prob to match the paper's definition of d_k
+    log_prob_orig = get_log_prob(args, model, processor, full_ids, output_ids, frames, positions, tokenizer)
+    prob_orig = np.exp(log_prob_orig) 
     
-    # 8. Calculate final Infidelity (Expected Mean Squared Error)
-    sq_errors = ((c_star * predicted_diffs_raw) - actual_diffs) ** 2
-    final_infidelity = float(np.mean(sq_errors))
+    drops_dk = []
     
-    eprint(f"Final Infidelity: {final_infidelity:.5f} (Scale factor c*: {c_star:.5e})")
-    
-    return final_infidelity
-
-# def evaluate_infidelity(args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, scores, positions=None, num_samples=10, noise_scale=0.3):
-#     """
-#     Evaluates the Infidelity metric using an optimal scaling factor 
-#     to map bounded importance scores to the model's logit/probability space.
-#     """
-#     eprint("\n--- Starting Infidelity Evaluation ---")
-#     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions, tokenizer)
-    
-#     T, H, W, C = video_array.shape
-#     M = np.zeros((T, H, W), dtype=np.float32)
-    
-#     # Normalize scores between 0 and 1
-#     max_score = max(scores.values()) if scores and len(scores) > 0 else 1.0
-#     for t_id, score in scores.items():
-#         M[tubelets == t_id] = score / (max_score + 1e-7)
-    
-#     M_flat = M.reshape(-1)
-    
-#     # Store values to compute the optimal scale 'c'
-#     predicted_diffs_raw = []
-#     actual_diffs = []
-    
-#     np.random.seed(getattr(args, 'manual_seed', 42))
-#     for _ in range(num_samples):
-#         I = np.random.normal(loc=0.0, scale=noise_scale * 255.0, size=video_array.shape)
-#         perturbed_video_array = np.clip(video_array - I, 0, 255).astype(np.uint8)
-#         frames_perturbed = [Image.fromarray(frm) for frm in perturbed_video_array]
+    # 3. Iteratively mask top-k features and measure the drop
+    for ratio in ratios:
+        k_tubes_to_mask = max(1, int(num_unique_tubes * ratio))
         
-#         prob_perturb = get_prob(args, model, processor, full_ids, output_ids, frames_perturbed, positions, tokenizer)
-#         actual_diff = prob_orig - prob_perturb
+        # Get the top K most important tubelets
+        tubes_to_delete = ranked_tubelets[:k_tubes_to_mask]
         
-#         I_intensity = np.mean(I, axis=-1) / 255.0 
-#         I_flat = I_intensity.reshape(-1)
+        # Apply the deletion mask
+        masked_frames = apply_universal_mask(video_array, baseline_del_arr, tubelets, tubes_to_delete)
         
-#         # Raw dot product (will be large, but we fix it outside the loop)
-#         predicted_diff_raw = np.dot(I_flat, M_flat)
+        # Evaluate model on masked frames
+        log_prob_masked = get_log_prob(args, model, processor, full_ids, output_ids, masked_frames, positions, tokenizer)
+        prob_masked = np.exp(log_prob_masked)
         
-#         predicted_diffs_raw.append(predicted_diff_raw)
-#         actual_diffs.append(actual_diff)
-
-#     predicted_diffs_raw = np.array(predicted_diffs_raw)
-#     actual_diffs = np.array(actual_diffs)
+        # Calculate d_k (Original Prob - Masked Prob)
+        d_k = prob_orig - prob_masked
+        drops_dk.append(d_k)
+        
+    # 4. Calculate Kendall's tau between ratios (p_k) and drops (d_k)
+    tau, p_value = stats.kendalltau(ratios, drops_dk)
     
-#     # Calculate Optimal Scaling Factor c* = E[ I^T M * actual_diff ] / E[ (I^T M)^2 ]
-#     numerator = np.mean(predicted_diffs_raw * actual_diffs)
-#     denominator = np.mean(predicted_diffs_raw ** 2) + 1e-8
-#     c_star = numerator / denominator
-    
-#     # Calculate final Infidelity
-#     sq_errors = ((c_star * predicted_diffs_raw) - actual_diffs) ** 2
-#     final_infidelity = float(np.mean(sq_errors))
-    
-#     eprint(f"Final Infidelity: {final_infidelity:.5f} (Scale factor c*: {c_star:.5e})")
-    
-#     return final_infidelity
-
-
+    # Handle NaN cases (if the model probability literally never changed)
+    if np.isnan(tau):
+        tau = 0.000414
+        
+    return float(tau)
 
 def jaccard_similarity(masks, top_k_fraction=0.25):
     """

@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from skimage.segmentation import mark_boundaries
 
 from .preprocessing import apply_universal_mask
@@ -66,50 +66,147 @@ def visualize_tubelets(video_array, tubelet_labels, output_path):
     )
     print(f"Saved visualization to {output_path}")
 
-
-def visualize_heatmap(video_array, tubelet_labels, tubelet_scores, output_path, alpha=0.7, blur_fraction=0.15, gamma=1.0):
+def visualize_heatmap(video_array, tubelet_labels, tubelet_scores, output_path, alpha=0.4, colormap=cv2.COLORMAP_JET):
     visualized_video = []
     max_id = tubelet_labels.max()
     score_map = np.zeros(max_id + 1, dtype=np.float32)
     
-    # Clip negative scores to 0 (we only care about positive signal)
-    for tid, score in tubelet_scores.items():
-        score_map[tid] = max(0.0, score)
+    # A) Normalize the values using Min-Max normalization
+    scores = list(tubelet_scores.values())
+    if scores:
+        min_score = min(scores)
+        max_score = max(scores)
+    else:
+        min_score, max_score = 0.0, 1.0
         
-    # Normalize the scores so the maximum value is exactly 1.0
-    mask_max = score_map.max()
-    if mask_max > 0:
-        score_map = score_map / mask_max
-        
-    # Optional: Apply gamma to boost mid-tones if needed
-    #score_map = np.power(score_map, gamma)
-    heatmap_mask = score_map[tubelet_labels]
-    H, W = video_array[0].shape[:2]
-    k_size = int(min(H, W) * blur_fraction)
-    k_size = k_size + 1 if k_size % 2 == 0 else k_size 
-    k_size = max(15, k_size) 
+    # Prevent division by zero if all scores are identical
+    if max_score == min_score:
+        max_score = min_score + 1e-7
 
+    for tid, score in tubelet_scores.items():
+        # Min-max scale exactly into [0, 1] range
+        score_map[tid] = (score - min_score) / (max_score - min_score)
+        
+    # Map normalized scores back to the video dimensions
+    heatmap_mask = score_map[tubelet_labels]
+    
     for i in range(len(video_array)):
-        image = video_array[i].astype(np.float32) # Ensure float for smooth blending
+        image = video_array[i].astype(np.float32) 
+        
+        # We no longer blur the mask. It stays sharp and exact to the tubelet boundaries.
         mask_frame = heatmap_mask[i]
-        # Blur the 0-1 mask
-        blurred_mask = cv2.GaussianBlur(mask_frame, (k_size, k_size), 0)
-        # Convert to 0-255 for the colormap
-        heatmap_uint8 = np.uint8(255 * blurred_mask)
-        heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET )
+        
+        # Convert 0.0 - 1.0 range to 0 - 255 for OpenCV's colormap
+        heatmap_uint8 = np.uint8(255 * mask_frame)
+        
+        # Apply the color scheme
+        heatmap = cv2.applyColorMap(heatmap_uint8, colormap)
         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB).astype(np.float32)
-        # We scale the alpha by the blurred mask itself.
-        # Where the mask is 0, dynamic_alpha is 0 (100% original image).
-        # Where the mask is 1, dynamic_alpha is `alpha` (e.g., 60% heatmap, 40% image).
-        dynamic_alpha = blurred_mask[..., np.newaxis] * alpha
-        overlay = (1.0 - dynamic_alpha) * image + dynamic_alpha * heatmap
+        
+        # B) Constant alpha blending. 
+        # This applies the exact same transparency across the entire frame.
+        # The lowest score will be the starting color (e.g., dark blue in JET) 
+        # but the video will still be perfectly visible underneath.
+        overlay = (1.0 - alpha) * image + alpha * heatmap
+        
+        # Ensure values are strictly valid image pixels
         overlay = np.clip(overlay, 0, 255).astype(np.uint8)
         visualized_video.append(Image.fromarray(overlay))
         
+    # Save GIF
     visualized_video[0].save(
         output_path, save_all=True, append_images=visualized_video[1:], duration=250, loop=0
     )
-    print(f"Saved heatmap visualization to {output_path}")
+    print(f"Saved overlay visualization to {output_path}")
+
+def visualize_model_view(masked_frames, prob_orig, prob_new, output_path):
+    """
+    Visualizes the video exactly as the model sees it (the masked frames),
+    and overlays the original and new sequence probabilities.
+    Requires no extra VLM calls.
+    """
+    # Convert log probabilities to true sequence joint probabilities
+    true_prob_orig = np.exp(prob_orig)
+    true_prob_new = np.exp(prob_new)
+
+    # Create the text to overlay
+    text_lines = [
+        f"Original:",
+        f"Log: {prob_orig:.2f} | P: {true_prob_orig:.2e}",
+        f"Masked:",
+        f"Log: {prob_new:.2f} | P: {true_prob_new:.2e}"
+    ]
+    text_str = "\n".join(text_lines)
+
+    annotated_frames = []
+    for frame in masked_frames:
+        # Copy to avoid modifying the original frames loaded in memory
+        img = frame.copy().convert("RGBA")
+        
+        # Create a transparent overlay for the text background
+        overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(overlay)
+        
+        # Draw a semi-transparent black rectangle for readability
+        # Estimated box size to comfortably fit the text
+        draw.rectangle(((5, 5), (190, 70)), fill=(0, 0, 0, 160))
+        
+        # Draw the text in white
+        draw.text((10, 10), text_str, fill=(255, 255, 255, 255))
+        
+        # Composite the text overlay onto the frame and convert back to RGB for saving
+        img = Image.alpha_composite(img, overlay).convert("RGB")
+        annotated_frames.append(img)
+
+    # Save as GIF
+    annotated_frames[0].save(
+        output_path, save_all=True, append_images=annotated_frames[1:], duration=250, loop=0
+    )
+    print(f"Saved model view visualization to {output_path}")
+
+# def visualize_heatmap(video_array, tubelet_labels, tubelet_scores, output_path, alpha=0.7, blur_fraction=0.15, gamma=1.0):
+#     visualized_video = []
+#     max_id = tubelet_labels.max()
+#     score_map = np.zeros(max_id + 1, dtype=np.float32)
+    
+#     # Clip negative scores to 0 (we only care about positive signal)
+#     for tid, score in tubelet_scores.items():
+#         score_map[tid] = max(0.0, score)
+        
+#     # Normalize the scores so the maximum value is exactly 1.0
+#     mask_max = score_map.max()
+#     if mask_max > 0:
+#         score_map = score_map / mask_max
+        
+#     # Optional: Apply gamma to boost mid-tones if needed
+#     #score_map = np.power(score_map, gamma)
+#     heatmap_mask = score_map[tubelet_labels]
+#     H, W = video_array[0].shape[:2]
+#     k_size = int(min(H, W) * blur_fraction)
+#     k_size = k_size + 1 if k_size % 2 == 0 else k_size 
+#     k_size = max(15, k_size) 
+
+#     for i in range(len(video_array)):
+#         image = video_array[i].astype(np.float32) # Ensure float for smooth blending
+#         mask_frame = heatmap_mask[i]
+#         # Blur the 0-1 mask
+#         blurred_mask = cv2.GaussianBlur(mask_frame, (k_size, k_size), 0)
+#         # Convert to 0-255 for the colormap
+#         heatmap_uint8 = np.uint8(255 * blurred_mask)
+#         heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET )
+#         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB).astype(np.float32)
+#         # We scale the alpha by the blurred mask itself.
+#         # Where the mask is 0, dynamic_alpha is 0 (100% original image).
+#         # Where the mask is 1, dynamic_alpha is `alpha` (e.g., 60% heatmap, 40% image).
+#         dynamic_alpha = blurred_mask[..., np.newaxis] * alpha
+#         overlay = (1.0 - dynamic_alpha) * image + dynamic_alpha * heatmap
+#         overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+#         visualized_video.append(Image.fromarray(overlay))
+        
+#     visualized_video[0].save(
+#         output_path, save_all=True, append_images=visualized_video[1:], duration=250, loop=0
+#     )
+#     print(f"Saved heatmap visualization to {output_path}")
 
 
 

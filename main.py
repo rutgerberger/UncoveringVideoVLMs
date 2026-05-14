@@ -25,7 +25,7 @@ eprint("Importing files 3/3...")
 
 from utils import *
 from optimizer import process_video
-from iGOS.igos_framewise import run_igos 
+from iGOS.igos_framewise import run_igos
 from args import init_args
 
 load_dotenv()
@@ -101,11 +101,10 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
     all_scores, all_selected_tubes = [], []
     all_prob_ins, all_prob_del = [], []
     all_auc_ins, all_auc_del = [], []
-    all_infd = []
     
-    prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions=positions, tokenizer=tokenizer)
-    prob_baseline_del = get_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions=positions, tokenizer=tokenizer)
-    prob_baseline_ins = get_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions=positions, tokenizer=tokenizer)
+    prob_orig = get_log_prob(args, model, processor, full_ids, output_ids, frames, positions=positions, tokenizer=tokenizer)
+    prob_baseline_del = get_log_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions=positions, tokenizer=tokenizer)
+    prob_baseline_ins = get_log_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions=positions, tokenizer=tokenizer)
     
     unique_tubes = np.unique(tubelets)
     k_fraction = getattr(args, 'k_fraction', 0.25)
@@ -131,27 +130,27 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
                 baseline_ins_arr, baseline_del_arr, positions, ivd
             )
 
-        top_final = selected_tubes[:k_tubes]
-        frames_ins = apply_universal_mask(video_array, baseline_ins_arr, tubelets, top_final)
-        prob_ins = get_prob(args, model, processor, full_ids, output_ids, frames_ins, positions=positions, tokenizer=tokenizer)
-        
-        keep_tubes_del = [t for t in unique_tubes if t not in top_final]
-        frames_del = apply_universal_mask(video_array, baseline_del_arr, tubelets, keep_tubes_del)
-        prob_del = get_prob(args, model, processor, full_ids, output_ids, frames_del, positions=positions, tokenizer=tokenizer)
+        frames_ins = apply_continuous_mask(video_array, baseline_ins_arr, tubelets, scores)
+        prob_ins = get_log_prob(args, model, processor, full_ids, output_ids, frames_ins, positions=positions, tokenizer=tokenizer)
+        scores_del = {t: 1.0 - s for t, s in scores.items()}
+        frames_del = apply_continuous_mask(video_array, baseline_del_arr, tubelets, scores_del)
+        prob_del = get_log_prob(args, model, processor, full_ids, output_ids, frames_del, positions=positions, tokenizer=tokenizer)
 
         auc_ins, auc_del = evaluate_auc(
             args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, 
             selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_{cur_file_prefix}mask", positions=positions
         )
 
-        infd = evaluate_infidelity(
-            args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, scores, baseline_del_arr, positions=positions
+        monotonicity_score = calculate_monotonicity(
+            args, model, processor, tokenizer, full_ids, output_ids, frames, 
+            video_array, tubelets, baseline_del_arr, selected_tubes, positions
         )
+        eprint(f"Monotonicity {monotonicity_score}")
 
         if getattr(args, 'save_visuals', True):
-            eprint(f"Visualizing the Masked Tubelets ({mode_name} - Run {run_idx+1}).")
-            keep_tubes_vis = [t for t in unique_tubes if t not in top_final]
-            visualize_spix(video_array, baseline_del_arr, tubelets, keep_tubes_vis, os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}mask_cutout.gif"))
+            eprint(f"Visualizing the Model View ({mode_name} - Run {run_idx+1}).")
+            visualize_model_view(frames_ins,prob_orig,prob_ins,os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}model_view_ins.gif"))
+            visualize_model_view(frames_del,prob_orig,prob_del,os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}model_view_del.gif"))
             visualize_heatmap(video_array, tubelets, scores, os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}highlight_mask.gif"))
 
         all_scores.append(scores)
@@ -160,13 +159,11 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         all_prob_del.append(prob_del)
         all_auc_ins.append(auc_ins)
         all_auc_del.append(auc_del)
-        all_infd.append(infd)
 
     iou_score = jaccard_similarity(all_scores, top_k_fraction=k_fraction) if num_runs > 1 else 1.0
     avg_auc_ins, std_auc_ins = float(np.mean(all_auc_ins)), float(np.std(all_auc_ins)) if num_runs > 1 else 0.0
     avg_auc_del, std_auc_del = float(np.mean(all_auc_del)), float(np.std(all_auc_del)) if num_runs > 1 else 0.0
     avg_prob_ins, avg_prob_del = float(np.mean(all_prob_ins)), float(np.mean(all_prob_del))
-    avg_infd, std_infd = float(np.mean(all_infd)), float(np.std(all_infd)) if num_runs > 1 else 0.0
 
     last_selected = all_selected_tubes[-1]
     last_scores = all_scores[-1]
@@ -185,8 +182,6 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         "auc_del": avg_auc_del,
         "auc_ins_std": std_auc_ins,
         "auc_del_std": std_auc_del,
-        "infd": avg_infd,
-        "infd_std": std_infd,
         "prob_orig": prob_orig,
         "prob_baseline_del": prob_baseline_del,
         "prob_baseline_ins": prob_baseline_ins,
@@ -282,6 +277,10 @@ def explain_data(data, model, processor, args, tokenizer):
         explained_count+=1
 
     if global_metrics:
+        all_prob_orig = [m["prob_orig"] for m in global_metrics]
+        all_prob_del = [m["prob_del"] for m in global_metrics]
+        dataset_faithfulness = calculate_faithfulness(all_prob_orig, all_prob_del)
+        eprint(f"Faithfulness {dataset_faithfulness}")
         log_metrics(args, global_metrics)
     if global_gt_metrics:
         log_metrics(args, global_gt_metrics, prefix="GT-")

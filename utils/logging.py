@@ -48,7 +48,6 @@ def log_experiment(args, log_func, ivd, question_text, ground_truth, model_answe
         "AUC Ins Std": round(auc_ins_std, 3),
         "AUC Del Mean": round(auc_del_mean, 3),
         "AUC Del Std": round(auc_del_std, 3),
-        "Infidelity": round(metrics.get("infd", 0.0), 3),
         "IoU (Jaccard)": round(iou_score, 4),
         "metrics": metrics
     }
@@ -74,7 +73,6 @@ def log_experiment(args, log_func, ivd, question_text, ground_truth, model_answe
     log_func(f"Prob when Inserting Mask (top {k_fraction*100}%): {prob_ins:.5f} (Diff: {prob_orig - prob_ins:.5f})")
     log_func(f"Prob when Deleting Mask (top {k_fraction*100}%): {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
     log_func(f"\nAUC Ins: {auc_ins_mean:.4f} ± {auc_ins_std:.4f} | Del: {auc_del_mean:.4f} ± {auc_del_std:.4f}")
-    log_func(f"Infidelity: {metrics.get('infd', 0.0):.5f} ± {metrics.get('infd_std', 0.0):.5f}") # <--- NEW
     
     if num_runs > 1:
         log_func(f"IoU (Jaccard Similarity) across {num_runs} runs: {iou_score:.4f}")
@@ -98,7 +96,6 @@ def log_metrics(args, metrics, prefix=""):
         summary = {
             f"{prefix}avg_auc_ins": float(np.mean([m['auc_ins'] for m in metrics])),
             f"{prefix}avg_auc_del": float(np.mean([m['auc_del'] for m in metrics])),
-            f"{prefix}avg_infidelity": float(np.mean([m.get('infd', 0.0) for m in metrics])),
             f"{prefix}avg_iou_score": float(np.mean([m.get('iou_score', 1.0) for m in metrics])),
             f"{prefix}avg_prob_diff_del_topx": float(avg_prob_diff_del_topx),
             f"{prefix}avg_prob_diff_del_blur": float(avg_prob_diff_del_blur),
