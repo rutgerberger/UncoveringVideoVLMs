@@ -145,7 +145,7 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
         )
 
         infd = evaluate_infidelity(
-            args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, scores, positions=positions
+            args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, scores, baseline_del_arr, positions=positions
         )
 
         if getattr(args, 'save_visuals', True):

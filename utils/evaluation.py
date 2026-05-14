@@ -196,62 +196,133 @@ def evaluate_auc(args, model, processor, tokenizer, full_ids, output_ids, frames
     
     return auc_ins, auc_del
 
-
-def evaluate_infidelity(args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, scores, positions=None, num_samples=10, noise_scale=0.05):
+def evaluate_infidelity(args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, scores, baseline_del_arr, positions=None, num_samples=15, max_masking_fraction=0.5):
     """
-    Evaluates the Infidelity metric: INFD = E[(I^T M - (f(x) - f(x-I)))^2]
+    Evaluates the Infidelity metric by perturbing semantic tubelets 
+    (blending them toward the baseline) rather than injecting pixel-wise Gaussian noise.
     """
-    eprint("\n--- Starting Infidelity Evaluation ---")
+    from utils.logging import eprint
+    eprint("\n--- Starting Infidelity Evaluation (Tubelet-Level) ---")
+    
     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions, tokenizer)
     
-    # Construct the dense explanation mask M from tubelet scores
     T, H, W, C = video_array.shape
-    M = np.zeros((T, H, W), dtype=np.float32)
+    unique_tubes = np.unique(tubelets)
+    num_tubes = len(unique_tubes)
     
-    # Normalize scores between 0 and 1 for numerical stability
-    max_score = max(scores.values()) if scores and len(scores) > 0 else 1.0
-    for t_id, score in scores.items():
-        M[tubelets == t_id] = score / (max_score + 1e-7)
+    # 1. Construct the Explanation Vector (Phi)
+    # We align the scores in a fixed array corresponding to unique_tubes
+    Phi = np.array([scores.get(t, 0.0) for t in unique_tubes], dtype=np.float32)
     
-    M_flat = M.reshape(-1)
-    infidelity_scores = []
+    predicted_diffs_raw = []
+    actual_diffs = []
     
-    # Infidelity expectation loop over random noise perturbations
     np.random.seed(getattr(args, 'manual_seed', 42))
+    
     for _ in range(num_samples):
-        # Generate random noise I (scaled to standard pixel space 0-255)
-        I = np.random.normal(loc=0.0, scale=noise_scale * 255.0, size=video_array.shape)
+        # 2. Generate Tubelet Perturbations (I)
+        # For each tubelet, pick a random masking intensity between 0 and max_masking_fraction.
+        # I_k = 1.0 means the tubelet is completely replaced by the baseline.
+        # I_k = 0.0 means the tubelet remains completely original.
+        I_vector = np.random.uniform(0.0, max_masking_fraction, size=num_tubes)
         
-        # Compute x - I and clamp to valid uint8 image range
-        perturbed_video_array = np.clip(video_array - I, 0, 255).astype(np.uint8)
+        # 3. Map the tubelet perturbation values to the video's spatial dimensions
+        I_spatial = np.zeros((T, H, W), dtype=np.float32)
+        for idx, t_id in enumerate(unique_tubes):
+            I_spatial[tubelets == t_id] = I_vector[idx]
+            
+        I_spatial_expanded = I_spatial[..., np.newaxis] # Shape: (T, H, W, 1)
+        
+        # 4. Create the Perturbed Video
+        # Blend the original video with the baseline based on the I_vector multipliers
+        perturbed_video_array = ((1.0 - I_spatial_expanded) * video_array + 
+                                 I_spatial_expanded * baseline_del_arr).astype(np.uint8)
+                                 
         frames_perturbed = [Image.fromarray(frm) for frm in perturbed_video_array]
         
-        # Model prediction on f(x - I)
+        # 5. Get the actual model probability drop
         prob_perturb = get_prob(args, model, processor, full_ids, output_ids, frames_perturbed, positions, tokenizer)
-        
-        # Actual model confidence drop
         actual_diff = prob_orig - prob_perturb
         
-        # Predicted drop: I^T M
-        # Average noise across RGB channels and normalize [0, 1] to match probability scale
-        I_intensity = np.mean(I, axis=-1) / 255.0 
-        I_flat = I_intensity.reshape(-1)
+        # 6. Get the explanation's predicted probability drop
+        # This is exactly I^T * Phi (dot product of perturbation vector and score vector)
+        predicted_diff_raw = np.dot(I_vector, Phi)
         
-        predicted_diff = np.dot(I_flat, M_flat)
-        
-        # Scale predicted_diff to a probability space by dividing by the mask sum.
-        # This prevents I^T M from blowing up due to large resolution dimensions.
-        sum_M = np.sum(M_flat) + 1e-7
-        predicted_diff_scaled = predicted_diff / sum_M
+        predicted_diffs_raw.append(predicted_diff_raw)
+        actual_diffs.append(actual_diff)
 
-        sq_error = (predicted_diff_scaled - actual_diff) ** 2
-        infidelity_scores.append(sq_error)
-        
-    final_infidelity = float(np.mean(infidelity_scores))
-    eprint(f"Final Infidelity: {final_infidelity:.5f}")
+    predicted_diffs_raw = np.array(predicted_diffs_raw)
+    actual_diffs = np.array(actual_diffs)
+    
+    # 7. Calculate Optimal Scaling Factor c*
+    # This securely maps the arbitrary scale of your CMA-ES weights into the model's actual probability scale
+    numerator = np.mean(predicted_diffs_raw * actual_diffs)
+    denominator = np.mean(predicted_diffs_raw ** 2) + 1e-8
+    c_star = numerator / denominator
+    
+    # 8. Calculate final Infidelity (Expected Mean Squared Error)
+    sq_errors = ((c_star * predicted_diffs_raw) - actual_diffs) ** 2
+    final_infidelity = float(np.mean(sq_errors))
+    
+    eprint(f"Final Infidelity: {final_infidelity:.5f} (Scale factor c*: {c_star:.5e})")
     
     return final_infidelity
 
+# def evaluate_infidelity(args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, scores, positions=None, num_samples=10, noise_scale=0.3):
+#     """
+#     Evaluates the Infidelity metric using an optimal scaling factor 
+#     to map bounded importance scores to the model's logit/probability space.
+#     """
+#     eprint("\n--- Starting Infidelity Evaluation ---")
+#     prob_orig = get_prob(args, model, processor, full_ids, output_ids, frames, positions, tokenizer)
+    
+#     T, H, W, C = video_array.shape
+#     M = np.zeros((T, H, W), dtype=np.float32)
+    
+#     # Normalize scores between 0 and 1
+#     max_score = max(scores.values()) if scores and len(scores) > 0 else 1.0
+#     for t_id, score in scores.items():
+#         M[tubelets == t_id] = score / (max_score + 1e-7)
+    
+#     M_flat = M.reshape(-1)
+    
+#     # Store values to compute the optimal scale 'c'
+#     predicted_diffs_raw = []
+#     actual_diffs = []
+    
+#     np.random.seed(getattr(args, 'manual_seed', 42))
+#     for _ in range(num_samples):
+#         I = np.random.normal(loc=0.0, scale=noise_scale * 255.0, size=video_array.shape)
+#         perturbed_video_array = np.clip(video_array - I, 0, 255).astype(np.uint8)
+#         frames_perturbed = [Image.fromarray(frm) for frm in perturbed_video_array]
+        
+#         prob_perturb = get_prob(args, model, processor, full_ids, output_ids, frames_perturbed, positions, tokenizer)
+#         actual_diff = prob_orig - prob_perturb
+        
+#         I_intensity = np.mean(I, axis=-1) / 255.0 
+#         I_flat = I_intensity.reshape(-1)
+        
+#         # Raw dot product (will be large, but we fix it outside the loop)
+#         predicted_diff_raw = np.dot(I_flat, M_flat)
+        
+#         predicted_diffs_raw.append(predicted_diff_raw)
+#         actual_diffs.append(actual_diff)
+
+#     predicted_diffs_raw = np.array(predicted_diffs_raw)
+#     actual_diffs = np.array(actual_diffs)
+    
+#     # Calculate Optimal Scaling Factor c* = E[ I^T M * actual_diff ] / E[ (I^T M)^2 ]
+#     numerator = np.mean(predicted_diffs_raw * actual_diffs)
+#     denominator = np.mean(predicted_diffs_raw ** 2) + 1e-8
+#     c_star = numerator / denominator
+    
+#     # Calculate final Infidelity
+#     sq_errors = ((c_star * predicted_diffs_raw) - actual_diffs) ** 2
+#     final_infidelity = float(np.mean(sq_errors))
+    
+#     eprint(f"Final Infidelity: {final_infidelity:.5f} (Scale factor c*: {c_star:.5e})")
+    
+#     return final_infidelity
 
 
 
