@@ -162,6 +162,25 @@ def evaluate_auc(args, model, processor, tokenizer, full_ids, output_ids, frames
     return auc_ins, auc_del
 
 
+def calculate_local_faithfulness(prob_orig, prob_masked, prob_baseline):
+    """
+    Calculates Faithfulness strictly for a single video.
+    Normalizes the log-probs against the theoretical max (0.0) 
+    and the video's specific baseline score (fully blurred).
+    """
+    theoretical_max = 0.0
+    # Edge case: If the baseline is somehow perfect, avoid division by zero
+    if theoretical_max == prob_baseline:
+        return 0.0
+        
+    # Normalize to [0, 1] bounds specific to this video's length and difficulty
+    orig_norm = (prob_orig - prob_baseline) / (theoretical_max - prob_baseline)
+    masked_norm = (prob_masked - prob_baseline) / (theoretical_max - prob_baseline)
+    # Calculate faithfulness: 1 - |normalized difference|
+    faithfulness = 1.0 - abs(orig_norm - masked_norm)
+    return float(faithfulness)
+
+
 def calculate_faithfulness(all_prob_orig, all_prob_del):
     """
     Calculates Faithfulness metric over all samples. Min/max normalization is based on
@@ -192,27 +211,21 @@ def calculate_faithfulness(all_prob_orig, all_prob_del):
 def calculate_monotonicity(args, model, processor, tokenizer, full_ids, output_ids, 
                            frames, video_array, tubelets, baseline_del_arr, 
                            ranked_tubelets, positions):
-    """
-    Calculates Monotonicity (Kendall's tau) by masking out increasing fractions 
-    of the most important tubelets.
-    """
-    # 1. Define the masking ratios (e.g., 10%, 20%, ... 90%)
-    ratios = np.linspace(0.1, 0.9, num=9)
-    num_unique_tubes = len(np.unique(tubelets))
     
-    # 2. Get the baseline prediction (0% masked)
-    # Convert log-prob to true prob to match the paper's definition of d_k
+    num_unique_tubes = len(ranked_tubelets)
+    if num_unique_tubes <= 1:
+        return 0.0 # Cannot calculate correlation with 1 data point
+        
     log_prob_orig = get_log_prob(args, model, processor, full_ids, output_ids, frames, positions, tokenizer)
     prob_orig = np.exp(log_prob_orig) 
     
     drops_dk = []
+    # Evaluate at discrete steps: 1 tube, 2 tubes, 3 tubes...
+    # (Skip the very last one so we don't just measure total deletion)
+    k_steps = list(range(1, num_unique_tubes)) 
     
-    # 3. Iteratively mask top-k features and measure the drop
-    for ratio in ratios:
-        k_tubes_to_mask = max(1, int(num_unique_tubes * ratio))
-        
-        # Get the top K most important tubelets
-        tubes_to_delete = ranked_tubelets[:k_tubes_to_mask]
+    for k in k_steps:
+        tubes_to_delete = ranked_tubelets[:k]
         
         # Apply the deletion mask
         masked_frames = apply_universal_mask(video_array, baseline_del_arr, tubelets, tubes_to_delete)
@@ -221,18 +234,39 @@ def calculate_monotonicity(args, model, processor, tokenizer, full_ids, output_i
         log_prob_masked = get_log_prob(args, model, processor, full_ids, output_ids, masked_frames, positions, tokenizer)
         prob_masked = np.exp(log_prob_masked)
         
-        # Calculate d_k (Original Prob - Masked Prob)
         d_k = prob_orig - prob_masked
         drops_dk.append(d_k)
+        eprint(k, d_k, prob_orig, prob_masked, len(tubes_to_delete))
         
-    # 4. Calculate Kendall's tau between ratios (p_k) and drops (d_k)
-    tau, p_value = stats.kendalltau(ratios, drops_dk)
+    # Calculate Kendall's tau
+    tau, p_value = stats.kendalltau(k_steps, drops_dk)
     
-    # Handle NaN cases (if the model probability literally never changed)
     if np.isnan(tau):
-        tau = 0.000414
+        tau = 0.0
         
     return float(tau)
+
+def get_p_normalized(p,p_baseline):
+    """
+    min-max normalization based on:
+    min: p_baseline (prob with everything blurred, negative)
+    max: 0.0        (log(1) = 0)
+    assumes: p < 0; p > p_baseline (which does not hold --> p_norm can be < 0)
+    """
+    return (p - p_baseline) / (0 - p_baseline)
+
+def get_sufficency(p_original,p_mask_when_shown):
+    """assumes p_orig and p_mask are normalized locally"""
+    sufficiency = 1 - (p_orig - p_mask_when_shown)
+    #Clip to [0,1] to be safe
+    return max(0, min(sufficiency,1))
+
+def get_necessity(p_baseline, p_mask_when_deleted):
+    """assumes p_baseline and p_mask are normalized locally"""
+    #Ideally p_mask_when_deleted limits p_baseline from above
+    #However, sometimes p_m.. < p_baseline which gives returns. > 1
+    necessity = 1 - (p_mask_when_deleted - p_baseline)
+    return max(0, min(necessity,1))
 
 def jaccard_similarity(masks, top_k_fraction=0.25):
     """

@@ -141,11 +141,13 @@ def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets
             selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_{cur_file_prefix}mask", positions=positions
         )
 
+        local_faithfulness = local_faithfulness = calculate_local_faithfulness(prob_orig=prob_orig, prob_masked=prob_del, prob_baseline=prob_baseline_del)
+
         monotonicity_score = calculate_monotonicity(
             args, model, processor, tokenizer, full_ids, output_ids, frames, 
             video_array, tubelets, baseline_del_arr, selected_tubes, positions
         )
-        eprint(f"Monotonicity {monotonicity_score}")
+        eprint(f"Monotonicity {monotonicity_score} | Local Faithfulness {local_faithfulness}")
 
         if getattr(args, 'save_visuals', True):
             eprint(f"Visualizing the Model View ({mode_name} - Run {run_idx+1}).")
