@@ -69,6 +69,7 @@ def log_global_metrics(args, all_metrics, prefix=""):
         values = [m[key] for m in all_metrics if key in m and m[key] is not None]
         if values:
             summary[f"{prefix}avg_{key}"] = float(np.mean(values))
+            summary[f"{prefix}std_{key}"] = float(np.std(values))
 
     # Calculate custom derived metrics if base requirements exist
     p_orig = np.array([m.get('prob_orig', 0) for m in all_metrics])
