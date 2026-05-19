@@ -1,107 +1,87 @@
-import sys
 import os
 import json
 import time
-
 import numpy as np
 from textwrap import fill
+import sys
 
 def eprint(*args, **kwargs):
     """Helper to log to stderr."""
     sep = ' '
     combined_text = sep.join(str(arg) for arg in args)
-    wrapped_lines = []
-    for line in combined_text.splitlines():
-        if line.strip() == "":
-            wrapped_lines.append("")
-        else:
-            wrapped_lines.append(fill(line, width=80))
-    final_text = "\n".join(wrapped_lines)
-    print(final_text, file=sys.stderr, **kwargs)
+    wrapped_lines = [fill(line, width=80) if line.strip() else "" for line in combined_text.splitlines()]
+    print("\n".join(wrapped_lines), file=sys.stderr, **kwargs)
 
-def log_frame_metrics(args, ivd, metrics):
+def log_frame_metrics(args, metrics):
+    """Appends a flat dictionary of metrics to a JSONL file."""
     os.makedirs(args.output_dir, exist_ok=True)
     metrics_file = os.path.join(args.output_dir, "frame_experiment_metrics.jsonl")
     with open(metrics_file, "a") as f:
         f.write(json.dumps(metrics) + "\n")
 
+def log_experiment(args, meta_info, metrics, start_time):
+    """
+    Dynamically logs an experiment run. 
+    meta_info: dict containing string/context info (question, answer, etc.)
+    metrics: dict containing numerical evaluation results.
+    """
+    # Save to JSONL
+    combined_data = {**meta_info, **metrics}
+    log_frame_metrics(args, combined_data)
 
-def log_experiment(args, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
-                   prob_orig, prob_baseline_del, prob_baseline_ins, prob_ins, prob_del, 
-                   auc_ins_mean, auc_del_mean, auc_ins_std, auc_del_std, iou_score, num_runs,
-                   metrics, top_k, fmt_ins, fmt_del, fmt_merged, 
-                   selected_ins, selected_del, selected_merged, unique_tubes, k_fraction, mode_name, start_time):
-    """Handles single experiment logging"""
+    # Print to Console
+    eprint("-" * 25)
+    eprint(f"Question {meta_info.get('video_index', 0)+1}/{args.num_videos}: {meta_info.get('question_text', '')}")
+    eprint(f"Ground Truth: {meta_info.get('ground_truth', '')}")
+    eprint(f"Model Answer: {meta_info.get('model_answer', '')}")
+    eprint(f"Extracted Keywords: {meta_info.get('keywords', '')} (Positions: {meta_info.get('positions', '')})")
+    eprint("-" * 25)
+    
+    eprint(f"=== {meta_info.get('mode_name', 'STANDARD')} Tubelets Search Log ===")
+    eprint(f"Pipeline executed in {(time.time() - start_time):.2f}s")
+    
+    # Dynamically print all metrics
+    for key, value in metrics.items():
+        if isinstance(value, float):
+            eprint(f"{key}: {value:.5f}")
+        else:
+            eprint(f"{key}: {value}")
+    eprint("\n")
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    metrics_file = os.path.join(args.output_dir, "frame_experiment_metrics.jsonl")
-    experiment_data = {
-        "video_index": ivd,
-        "num_frames": getattr(args, 'num_frames', 8),
-        "num_runs": num_runs,
-        "Prob orig": round(prob_orig, 3),
-        "Prob_baseline_del": round(prob_baseline_del, 3),
-        "Prob_baseline_ins": round(prob_baseline_ins, 3),
-        "Prob ins Mean": round(prob_ins, 3),
-        "Prob del Mean": round(prob_del, 3),
-        "AUC Ins Mean": round(auc_ins_mean, 3),
-        "AUC Ins Std": round(auc_ins_std, 3),
-        "AUC Del Mean": round(auc_del_mean, 3),
-        "AUC Del Std": round(auc_del_std, 3),
-        "IoU (Jaccard)": round(iou_score, 4),
-        "metrics": metrics
+def log_global_metrics(args, all_metrics, prefix=""):
+    """
+    Dynamically computes the mean for all numeric keys across a list of metric dictionaries
+    and saves the summary to a JSON file.
+    """
+    if not all_metrics:
+        return
+
+    summary = {}
+    # Find all unique numeric keys across all metric dictionaries
+    numeric_keys = {
+        key for metrics in all_metrics 
+        for key, val in metrics.items() 
+        if isinstance(val, (int, float, np.number)) and not isinstance(val, bool)
     }
+
+    # Calculate means dynamically
+    for key in numeric_keys:
+        values = [m[key] for m in all_metrics if key in m and m[key] is not None]
+        if values:
+            summary[f"{prefix}avg_{key}"] = float(np.mean(values))
+
+    # Calculate custom derived metrics if base requirements exist
+    p_orig = np.array([m.get('prob_orig', 0) for m in all_metrics])
+    p_del = np.array([m.get('prob_del', 0) for m in all_metrics])
+    p_b_del = np.array([m.get('prob_baseline_del', 0) for m in all_metrics])
     
-    with open(metrics_file, "a") as f:
-        f.write(json.dumps(experiment_data) + "\n")
+    avg_diff_del = np.mean(p_orig - p_del)
+    avg_diff_base = np.mean(p_orig - p_b_del)
+    if avg_diff_base != 0:
+        summary[f"{prefix}prob_del_explained"] = float(avg_diff_del / avg_diff_base)
 
-    log_func("-" * 25)
-    log_func(f"Question {ivd+1}/{args.num_videos}: {question_text}")
-    log_func(f"Ground Truth: {ground_truth}")
-    log_func(f"Model Answer: {model_answer}")
-    log_func(f"Extracted Keywords: {keywords} (Positions: {positions})")
-    log_func("-" * 25)
-    log_func(f"Original probs: {prob_orig:.5f}")
-    log_func(f"baseline_del probs: {prob_baseline_del:.5f}")
-    log_func(f"baseline_ins probs: {prob_baseline_ins:.5f}\n")
-
-    log_func(f"=== {mode_name} Tubelets Search Log ===")
-    log_func(f"Created tubelets and optimized weights in {(time.time() - start_time):.2f}s")
-    log_func(f"Final Insertion tubelets (Top {top_k}): {fmt_ins} ({len(selected_ins)}/{len(unique_tubes)})")
-    log_func(f"Final Deletion tubelets (Top {top_k}): {fmt_del} ({len(selected_del)}/{len(unique_tubes)})")
-    log_func(f"Final Combined tubelets (Top {top_k}): {fmt_merged} ({len(selected_merged)}/{len(unique_tubes)})")
-    log_func(f"Prob when Inserting Mask (top {k_fraction*100}%): {prob_ins:.5f} (Diff: {prob_orig - prob_ins:.5f})")
-    log_func(f"Prob when Deleting Mask (top {k_fraction*100}%): {prob_del:.5f} (Diff: {prob_orig - prob_del:.5f})")
-    log_func(f"\nAUC Ins: {auc_ins_mean:.4f} ± {auc_ins_std:.4f} | Del: {auc_del_mean:.4f} ± {auc_del_std:.4f}")
-    
-    if num_runs > 1:
-        log_func(f"IoU (Jaccard Similarity) across {num_runs} runs: {iou_score:.4f}")
-
-def log_metrics(args, metrics, prefix=""):
-    """dump experiment metrics in log file"""
-        
-    with open(os.path.join(args.output_dir, f'{prefix}final_metrics.json'), 'w') as f:
-        p_orig = np.array([m['prob_orig'] for m in metrics])
-        p_del = np.array([m['prob_del'] for m in metrics])
-        p_b_del = np.array([m['prob_baseline_del'] for m in metrics])
-        p_ins = np.array([m['prob_ins'] for m in metrics])
-        p_b_ins = np.array([m['prob_baseline_ins'] for m in metrics])
-        
-        # Calculate average probability differences
-        avg_prob_diff_del_topx = np.mean(p_orig - p_del)
-        avg_prob_diff_del_blur = np.mean(p_orig - p_b_del)
-        avg_prob_diff_ins_topx = np.mean(p_ins - p_b_ins)
-        avg_prob_diff_ins_orig = np.mean(p_orig - p_b_ins)
-        
-        summary = {
-            f"{prefix}avg_auc_ins": float(np.mean([m['auc_ins'] for m in metrics])),
-            f"{prefix}avg_auc_del": float(np.mean([m['auc_del'] for m in metrics])),
-            f"{prefix}avg_iou_score": float(np.mean([m.get('iou_score', 1.0) for m in metrics])),
-            f"{prefix}avg_prob_diff_del_topx": float(avg_prob_diff_del_topx),
-            f"{prefix}avg_prob_diff_del_blur": float(avg_prob_diff_del_blur),
-            f"{prefix}avg_prob_diff_ins_topx": float(avg_prob_diff_ins_topx),
-            f"{prefix}avg_prob_diff_ins_orig": float(avg_prob_diff_ins_orig),
-            f"{prefix}prob_del_explained": float(avg_prob_diff_del_topx / avg_prob_diff_del_blur) if avg_prob_diff_del_blur != 0 else 0.0,
-            f"{prefix}prob_ins_explained": float(avg_prob_diff_ins_topx / avg_prob_diff_ins_orig) if avg_prob_diff_ins_orig != 0 else 0.0,
-        }
+    # Save to disk
+    out_path = os.path.join(args.output_dir, f'{prefix}final_metrics.json')
+    with open(out_path, 'w') as f:
         json.dump(summary, f, indent=4)
+    eprint(f"Global metrics saved to {out_path}")

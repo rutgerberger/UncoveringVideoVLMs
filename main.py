@@ -44,153 +44,35 @@ def xai_method(args, model, tokenizer, processor, input_ids, output_ids, full_id
     else:
         return 0
 
-def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets, 
-                     baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, 
-                     special_ids, input_ids, output_ids, full_ids, question_text, ground_truth, model_answer, 
-                     target_text, ivd, log_func, mode_name, file_prefix):
-    """
-    Runs XAI pipeline for a single video and handles logging
-    """
+def explain_vid(args, model_ctx, vid_ctx, meta_info):
     start = time.time()
+    ivd = vid_ctx['ivd']
+    eprint(f"{ivd+1}/{args.num_videos}: Selecting Keywords ({meta_info['mode_name']}).")
+    
+    model, processor, tokenizer = model_ctx['model'], model_ctx['processor'], model_ctx['tokenizer']
 
-    eprint(f"{ivd+1}/{args.num_videos}: Selecting Keywords ({mode_name}).")
-    positions, keywords = find_keywords(
-        args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, 
-        target_text, tokenizer=tokenizer, use_yake=args.use_yake, special_ids=special_ids
+    vid_ctx['positions'], keywords = find_keywords(
+        args, model, processor, vid_ctx['input_ids'], vid_ctx['output_ids'], vid_ctx['frames'], 
+        vid_ctx['baseline_ins_frames'], meta_info['target_text'], tokenizer=tokenizer, 
+        use_yake=args.use_yake, special_ids=vid_ctx['special_ids']
     )
+    meta_info['keywords'] = keywords
+    meta_info['positions'] = vid_ctx['positions']
 
-    if getattr(args, 'method', '') == 'igos':
-        num_runs = 10 if getattr(args, 'experiment', '') == 'similarity' else 1
-        masks = []
-        all_auc_ins = []
-        all_auc_del = []
-        for i in range(num_runs):
-            mask, auc_ins, auc_del, prob_orig, prob_blur = run_igos(
-                args=args, model=model, processor=processor, full_ids=full_ids, 
-                output_ids=output_ids, frames=frames, baseline_frames=baseline_ins_frames, 
-                positions=positions, ivd=ivd
-            )
-            all_auc_ins.append(auc_ins)
-            all_auc_del.append(auc_del)
-            masks.append(mask)
-        jaccard_score = jaccard_similarity_pixel(masks, top_k_fraction=getattr(args, 'k_fraction', 0.1))
-        avg_auc_ins, std_auc_ins = float(np.mean(all_auc_ins)), float(np.std(all_auc_ins)) if num_runs > 1 else 0.0
-        avg_auc_del, std_auc_del = float(np.mean(all_auc_del)), float(np.std(all_auc_del)) if num_runs > 1 else 0.0
-        eprint(f"iGOS jaccard score: {jaccard_score}")
-        metrics = {
-            "video_index": ivd,
-            "auc_ins": avg_auc_ins,
-            "auc_del": avg_auc_del,
-            "auc_ins_std": std_auc_ins,
-            "auc_del_std": std_auc_del,
-            "prob_orig": prob_orig,
-            "prob_baseline_ins": prob_blur,
-            "prob_baseline_del": prob_blur, 
-            "prob_ins": prob_orig, 
-            "prob_del": prob_blur, 
-            "iou_score": jaccard_score
-        }
-        log_frame_metrics(args, ivd, metrics)
-        return metrics
-        
+    # Optimization Step
     eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
-    
-    num_runs = 10 if getattr(args, 'experiment', '') == 'similarity' else 1
-    random_baseline_run = True if getattr(args, 'experiment', 'default') == 'random_baseline' else False
-    
-    all_scores, all_selected_tubes = [], []
-    all_prob_ins, all_prob_del = [], []
-    all_auc_ins, all_auc_del = [], []
-    
-    prob_orig = get_log_prob(args, model, processor, full_ids, output_ids, frames, positions=positions, tokenizer=tokenizer)
-    prob_baseline_del = get_log_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions=positions, tokenizer=tokenizer)
-    prob_baseline_ins = get_log_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions=positions, tokenizer=tokenizer)
-    
-    unique_tubes = np.unique(tubelets)
-    k_fraction = getattr(args, 'k_fraction', 0.25)
-    k_tubes = max(1, int(len(unique_tubes) * k_fraction))
-
-    for run_idx in range(num_runs):
-        if num_runs > 1:
-            eprint(f"\n--- Consistency Run {run_idx+1}/{num_runs} ---")
-            np.random.seed(getattr(args, 'manual_seed', 42) + run_idx)
-            torch.manual_seed(getattr(args, 'manual_seed', 42) + run_idx)
-            cur_file_prefix = f"{file_prefix}sim_{run_idx+1}_"
-        else:
-            cur_file_prefix = file_prefix
-
-        if random_baseline_run:
-            eprint(f"Running randomized baseline ({mode_name} - Run {run_idx+1}).")
-            scores = {t: float(np.random.uniform(0, 1)) for t in unique_tubes}
-            selected_tubes = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
-            metrics = {"status": "randomized"}
-        else:
-            selected_tubes, scores, metrics = xai_method(
-                args, model, tokenizer, processor, input_ids, output_ids, full_ids, frames, tubelets, 
-                baseline_ins_arr, baseline_del_arr, positions, ivd
-            )
-
-        frames_ins = apply_continuous_mask(video_array, baseline_ins_arr, tubelets, scores)
-        prob_ins = get_log_prob(args, model, processor, full_ids, output_ids, frames_ins, positions=positions, tokenizer=tokenizer)
-        scores_del = {t: 1.0 - s for t, s in scores.items()}
-        frames_del = apply_continuous_mask(video_array, baseline_del_arr, tubelets, scores_del)
-        prob_del = get_log_prob(args, model, processor, full_ids, output_ids, frames_del, positions=positions, tokenizer=tokenizer)
-
-        auc_ins, auc_del = evaluate_auc(
-            args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, 
-            selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_{cur_file_prefix}mask", positions=positions
-        )
-
-        local_faithfulness = local_faithfulness = calculate_local_faithfulness(prob_orig=prob_orig, prob_masked=prob_del, prob_baseline=prob_baseline_del)
-
-        monotonicity_score = calculate_monotonicity(
-            args, model, processor, tokenizer, full_ids, output_ids, frames, 
-            video_array, tubelets, baseline_del_arr, selected_tubes, positions
-        )
-        eprint(f"Monotonicity {monotonicity_score} | Local Faithfulness {local_faithfulness}")
-
-        if getattr(args, 'save_visuals', True):
-            eprint(f"Visualizing the Model View ({mode_name} - Run {run_idx+1}).")
-            visualize_model_view(frames_ins,prob_orig,prob_ins,os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}model_view_ins.gif"))
-            visualize_model_view(frames_del,prob_orig,prob_del,os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}model_view_del.gif"))
-            visualize_heatmap(video_array, tubelets, scores, os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}highlight_mask.gif"))
-
-        all_scores.append(scores)
-        all_selected_tubes.append(selected_tubes)
-        all_prob_ins.append(prob_ins)
-        all_prob_del.append(prob_del)
-        all_auc_ins.append(auc_ins)
-        all_auc_del.append(auc_del)
-
-    iou_score = jaccard_similarity(all_scores, top_k_fraction=k_fraction) if num_runs > 1 else 1.0
-    avg_auc_ins, std_auc_ins = float(np.mean(all_auc_ins)), float(np.std(all_auc_ins)) if num_runs > 1 else 0.0
-    avg_auc_del, std_auc_del = float(np.mean(all_auc_del)), float(np.std(all_auc_del)) if num_runs > 1 else 0.0
-    avg_prob_ins, avg_prob_del = float(np.mean(all_prob_ins)), float(np.mean(all_prob_del))
-
-    last_selected = all_selected_tubes[-1]
-    last_scores = all_scores[-1]
-    top_k = min(5, len(last_selected))
-    fmt_scores = {t: f"{last_scores.get(t, 0):.4f}" for t in last_selected[:top_k]}
- 
-    log_experiment(args, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
-        prob_orig, prob_baseline_del, prob_baseline_ins, avg_prob_ins, avg_prob_del, 
-        avg_auc_ins, avg_auc_del, std_auc_ins, std_auc_del, iou_score, num_runs,
-        metrics, top_k, fmt_scores, fmt_scores, fmt_scores, 
-        last_selected, last_selected, last_selected, unique_tubes, k_fraction, mode_name, start
+    selected_tubes, scores, _ = xai_method(
+        args, model, tokenizer, processor, vid_ctx['input_ids'], vid_ctx['output_ids'], 
+        vid_ctx['full_ids'], vid_ctx['frames'], vid_ctx['tubelets'], 
+        vid_ctx['baseline_ins_arr'], vid_ctx['baseline_del_arr'], vid_ctx['positions'], ivd
     )
 
-    return {
-        "auc_ins": avg_auc_ins,
-        "auc_del": avg_auc_del,
-        "auc_ins_std": std_auc_ins,
-        "auc_del_std": std_auc_del,
-        "prob_orig": prob_orig,
-        "prob_baseline_del": prob_baseline_del,
-        "prob_baseline_ins": prob_baseline_ins,
-        "prob_ins": avg_prob_ins,
-        "prob_del": avg_prob_del,
-        "iou_score": iou_score
-    }
+    # Evaluation
+    metrics = evaluate_result(args, model_ctx, vid_ctx, selected_tubes, scores, num_runs=1)
+    # Logging 
+    log_experiment(args, meta_info, metrics, start_time=start)
+
+    return metrics
 
 def explain_data(data, model, processor, args, tokenizer):
     """
@@ -198,22 +80,19 @@ def explain_data(data, model, processor, args, tokenizer):
     param model: HF VLM model
     param processor: processor alongside the model
     param args: run arguments
-    param tokenizer: "  "  alongside the model
-    for each datapoint, runs XAI pipeline
+    param tokenizer: tokenizer alongside the model
+    
+    For each datapoint, runs the modular XAI pipeline.
     """
     now = datetime.datetime.now() 
     setting = f'{now.month}{now.day}-{now.hour}{now.minute}'
     out_dir = os.path.join(args.output_dir, setting)
     args.output_dir = out_dir
     os.makedirs(args.output_dir, exist_ok=True)
+    
     with open(os.path.join(out_dir, 'args.json'), 'w') as f:
         json.dump(vars(args), f, indent=4)
-    log_file = os.path.join(args.output_dir, "log.txt")
-    
-    def log(msg):
-        with open(log_file, "a") as f:
-            f.write(str(msg) + "\n")
-            
+        
     target_num_videos = min(len(data), args.num_videos) if args.num_videos > 0 else len(data)
     global_metrics = []
     global_gt_metrics = []
@@ -221,71 +100,109 @@ def explain_data(data, model, processor, args, tokenizer):
     if args.randomize_data:
         random.shuffle(data)
 
+    # Model Context (so we don't have to pass gigantic headers)
+    model_ctx = {'model': model, 'processor': processor, 'tokenizer': tokenizer}
+    
+    # Main Processing Loop
     explained_count = 0
     for ivd in range(len(data)):
         if explained_count >= target_num_videos:
             break
+            
         eprint(f"\nProcessing target {explained_count+1}/{target_num_videos} (Row {ivd}): Retrieving data.")
         start = time.time()
-
-        try:
+        try: #Sometimes the vid does not exist, continue to the next
             frames, qs, cur_prompt, correct_idx = get_data(args, data[ivd])
             ground_truth_label = str(correct_idx)
             prompt = f"USER: {DEFAULT_VIDEO_TOKEN}\n{qs}. ASSISTANT:"
         except Exception as e:
             eprint(f"Error loading row {ivd}: {e}")
             continue
-            
         eprint(f"Retrieved data in {time.time() - start:.2f}s")
 
+        # Initial Forward Pass & Tubelet Generation
         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
         special_ids = [idx for idx in [tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id] if idx is not None]
         full_ids = torch.cat((input_ids, output_ids), dim=1)
-
         eprint(f"{ivd+1}/{args.num_videos}: Creating Tubelets and Baseline Frames.")
         video_array, tubelets = generate_tubelets_optimized(frames, args)
+
+        # Creating baseline frames for optimization
         baseline_ins_arr = get_baseline_insertion(args, video_array)
         baseline_del_arr = get_baseline_deletion(args, video_array)
         baseline_ins_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins_arr]
         baseline_del_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del_arr]
         
+        # Filtering: is the answer actually related to visual evidence?
         PROB_DROP_THRESHOLD = 0.30
         if get_prob_drop(args, model, processor, full_ids, baseline_ins_frames, output_ids, frames, tokenizer) < PROB_DROP_THRESHOLD:
             eprint("Visual evidence too little. Skipping video")
             continue
             
-        metrics = explain_vid(
-            args, model, processor, tokenizer, frames, video_array, tubelets, 
-            baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, special_ids,
-            input_ids, output_ids, full_ids, qs, ground_truth_label, output_text, output_text, ivd, log, 
-            mode_name="STANDARD", file_prefix=""
-        )
+        # Pack Contexts (so we don't have to pass ugly headers)
+        vid_ctx = {
+            'ivd': ivd,
+            'frames': frames,
+            'video_array': video_array,
+            'tubelets': tubelets,
+            'baseline_ins_arr': baseline_ins_arr,
+            'baseline_del_arr': baseline_del_arr,
+            'baseline_ins_frames': baseline_ins_frames,
+            'baseline_del_frames': baseline_del_frames,
+            'input_ids': input_ids,
+            'output_ids': output_ids,
+            'full_ids': full_ids,
+            'special_ids': special_ids,
+            'positions': None # Will be populated by explain_vid
+        }
+        meta_info = {
+            'video_index': ivd,
+            'question_text': qs,
+            'ground_truth': ground_truth_label,
+            'model_answer': output_text,
+            'target_text': output_text,
+            'mode_name': "STANDARD"
+        }
 
+        # This is where we call our method
+        metrics = explain_vid(args, model_ctx, vid_ctx, meta_info)
         global_metrics.append(metrics)
 
+        # Ground Truth Forcing Execution (Optional)
         if getattr(args, 'gt_forcing', False):    
             gt_ids = tokenizer(ground_truth_label, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)
             if gt_ids is not None:
-                gt_metrics = explain_vid(
-                    args, model, processor, tokenizer, frames, video_array, tubelets, 
-                    baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, special_ids,
-                    input_ids, gt_ids, qs, ground_truth_label, output_text, ground_truth_label, ivd, log, 
-                    mode_name="GROUND TRUTH", file_prefix="gt_"
-                )
+                # Duplicate and override contexts for GT forcing
+                gt_vid_ctx = vid_ctx.copy()
+                gt_vid_ctx['output_ids'] = gt_ids
+                # Re-concatenate full_ids since output_ids changed (critical fix)
+                gt_vid_ctx['full_ids'] = torch.cat((input_ids, gt_ids), dim=1)
+                
+                gt_meta_info = meta_info.copy()
+                gt_meta_info['target_text'] = ground_truth_label
+                gt_meta_info['mode_name'] = "GROUND TRUTH"
+                
+                gt_metrics = explain_vid(args, model_ctx, gt_vid_ctx, gt_meta_info)
                 global_gt_metrics.append(gt_metrics)
 
+        # Cleanup
         gc.collect()
         torch.cuda.empty_cache()
-        explained_count+=1
+        explained_count += 1
 
+    # Final Global Logging
     if global_metrics:
-        all_prob_orig = [m["prob_orig"] for m in global_metrics]
-        all_prob_del = [m["prob_del"] for m in global_metrics]
-        dataset_faithfulness = calculate_faithfulness(all_prob_orig, all_prob_del)
-        eprint(f"Faithfulness {dataset_faithfulness}")
-        log_metrics(args, global_metrics)
+        # Calculate dataset-wide faithfulness before dumping global metrics
+        all_prob_orig = [m.get("prob_orig", 0) for m in global_metrics]
+        all_prob_del = [m.get("prob_del", 0) for m in global_metrics]
+        try:
+            dataset_faithfulness = calculate_faithfulness(all_prob_orig, all_prob_del)
+            eprint(f"\nDataset Faithfulness: {dataset_faithfulness:.4f}")
+        except Exception as e:
+            eprint(f"Could not calculate global dataset faithfulness: {e}")
+        log_global_metrics(args, global_metrics)
     if global_gt_metrics:
-        log_metrics(args, global_gt_metrics, prefix="GT-")
+        log_global_metrics(args, global_gt_metrics, prefix="GT-")
 
     eprint(f"\nExperiment Complete. Mean metrics saved to {args.output_dir}/final_metrics.json")
 
@@ -354,3 +271,249 @@ if __name__ == "__main__":
         data = load_dataset(args.data_path, "val")["val"].to_pandas().to_dict(orient="records")
         
     explain_data(data, model, processor, args, tokenizer)
+
+#def explain_vid(args, model, processor, tokenizer, frames, video_array, tubelets, 
+#                      baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, 
+#                      special_ids, input_ids, output_ids, full_ids, question_text, ground_truth, model_answer, 
+#                      target_text, ivd, log_func, mode_name, file_prefix):
+#     """
+#     Runs XAI pipeline for a single video and handles logging
+#     """
+#     start = time.time()
+
+#     eprint(f"{ivd+1}/{args.num_videos}: Selecting Keywords ({mode_name}).")
+#     positions, keywords = find_keywords(
+#         args, model, processor, input_ids, output_ids, frames, baseline_ins_frames, 
+#         target_text, tokenizer=tokenizer, use_yake=args.use_yake, special_ids=special_ids
+#     )
+
+#     if getattr(args, 'method', '') == 'igos':
+#         num_runs = 10 if getattr(args, 'experiment', '') == 'similarity' else 1
+#         masks = []
+#         all_auc_ins = []
+#         all_auc_del = []
+#         for i in range(num_runs):
+#             mask, auc_ins, auc_del, prob_orig, prob_blur = run_igos(
+#                 args=args, model=model, processor=processor, full_ids=full_ids, 
+#                 output_ids=output_ids, frames=frames, baseline_frames=baseline_ins_frames, 
+#                 positions=positions, ivd=ivd
+#             )
+#             all_auc_ins.append(auc_ins)
+#             all_auc_del.append(auc_del)
+#             masks.append(mask)
+#         jaccard_score = jaccard_similarity_pixel(masks, top_k_fraction=getattr(args, 'k_fraction', 0.1))
+#         avg_auc_ins, std_auc_ins = float(np.mean(all_auc_ins)), float(np.std(all_auc_ins)) if num_runs > 1 else 0.0
+#         avg_auc_del, std_auc_del = float(np.mean(all_auc_del)), float(np.std(all_auc_del)) if num_runs > 1 else 0.0
+#         eprint(f"iGOS jaccard score: {jaccard_score}")
+#         metrics = {
+#             "video_index": ivd,
+#             "auc_ins": avg_auc_ins,
+#             "auc_del": avg_auc_del,
+#             "auc_ins_std": std_auc_ins,
+#             "auc_del_std": std_auc_del,
+#             "prob_orig": prob_orig,
+#             "prob_baseline_ins": prob_blur,
+#             "prob_baseline_del": prob_blur, 
+#             "prob_ins": prob_orig, 
+#             "prob_del": prob_blur, 
+#             "iou_score": jaccard_score
+#         }
+#         log_frame_metrics(args, ivd, metrics)
+#         return metrics
+        
+#     eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
+    
+#     num_runs = 10 if getattr(args, 'experiment', '') == 'similarity' else 1
+#     random_baseline_run = True if getattr(args, 'experiment', 'default') == 'random_baseline' else False
+    
+#     all_scores, all_selected_tubes = [], []
+#     all_prob_ins, all_prob_del = [], []
+#     all_auc_ins, all_auc_del = [], []
+    
+#     prob_orig = get_log_prob(args, model, processor, full_ids, output_ids, frames, positions=positions, tokenizer=tokenizer)
+#     prob_baseline_del = get_log_prob(args, model, processor, full_ids, output_ids, baseline_del_frames, positions=positions, tokenizer=tokenizer)
+#     prob_baseline_ins = get_log_prob(args, model, processor, full_ids, output_ids, baseline_ins_frames, positions=positions, tokenizer=tokenizer)
+    
+#     unique_tubes = np.unique(tubelets)
+#     k_fraction = getattr(args, 'k_fraction', 0.25)
+#     k_tubes = max(1, int(len(unique_tubes) * k_fraction))
+
+#     for run_idx in range(num_runs):
+#         if num_runs > 1:
+#             eprint(f"\n--- Consistency Run {run_idx+1}/{num_runs} ---")
+#             np.random.seed(getattr(args, 'manual_seed', 42) + run_idx)
+#             torch.manual_seed(getattr(args, 'manual_seed', 42) + run_idx)
+#             cur_file_prefix = f"{file_prefix}sim_{run_idx+1}_"
+#         else:
+#             cur_file_prefix = file_prefix
+
+#         if random_baseline_run:
+#             eprint(f"Running randomized baseline ({mode_name} - Run {run_idx+1}).")
+#             scores = {t: float(np.random.uniform(0, 1)) for t in unique_tubes}
+#             selected_tubes = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
+#             metrics = {"status": "randomized"}
+#         else:
+#             selected_tubes, scores, metrics = xai_method(
+#                 args, model, tokenizer, processor, input_ids, output_ids, full_ids, frames, tubelets, 
+#                 baseline_ins_arr, baseline_del_arr, positions, ivd
+#             )
+
+#         frames_ins = apply_continuous_mask(video_array, baseline_ins_arr, tubelets, scores)
+#         prob_ins = get_log_prob(args, model, processor, full_ids, output_ids, frames_ins, positions=positions, tokenizer=tokenizer)
+#         scores_del = {t: 1.0 - s for t, s in scores.items()}
+#         frames_del = apply_continuous_mask(video_array, baseline_del_arr, tubelets, scores_del)
+#         prob_del = get_log_prob(args, model, processor, full_ids, output_ids, frames_del, positions=positions, tokenizer=tokenizer)
+
+#         auc_ins, auc_del = evaluate_auc(
+#             args, model, processor, tokenizer, full_ids, output_ids, frames, video_array, tubelets, 
+#             selected_tubes, baseline_ins_arr, baseline_del_arr, ivd=f"{ivd}_{cur_file_prefix}mask", positions=positions
+#         )
+
+#         local_faithfulness = local_faithfulness = calculate_local_faithfulness(prob_orig=prob_orig, prob_masked=prob_del, prob_baseline=prob_baseline_del)
+
+#         monotonicity_score = calculate_monotonicity(
+#             args, model, processor, tokenizer, full_ids, output_ids, frames, 
+#             video_array, tubelets, baseline_del_arr, selected_tubes, positions
+#         )
+#         eprint(f"Monotonicity {monotonicity_score} | Local Faithfulness {local_faithfulness}")
+
+#         if getattr(args, 'save_visuals', True):
+#             eprint(f"Visualizing the Model View ({mode_name} - Run {run_idx+1}).")
+#             visualize_model_view(frames_ins,prob_orig,prob_ins,os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}model_view_ins.gif"))
+#             visualize_model_view(frames_del,prob_orig,prob_del,os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}model_view_del.gif"))
+#             visualize_heatmap(video_array, tubelets, scores, os.path.join(args.output_dir, f"{ivd}_{cur_file_prefix}highlight_mask.gif"))
+
+#         all_scores.append(scores)
+#         all_selected_tubes.append(selected_tubes)
+#         all_prob_ins.append(prob_ins)
+#         all_prob_del.append(prob_del)
+#         all_auc_ins.append(auc_ins)
+#         all_auc_del.append(auc_del)
+
+#     iou_score = jaccard_similarity(all_scores, top_k_fraction=k_fraction) if num_runs > 1 else 1.0
+#     avg_auc_ins, std_auc_ins = float(np.mean(all_auc_ins)), float(np.std(all_auc_ins)) if num_runs > 1 else 0.0
+#     avg_auc_del, std_auc_del = float(np.mean(all_auc_del)), float(np.std(all_auc_del)) if num_runs > 1 else 0.0
+#     avg_prob_ins, avg_prob_del = float(np.mean(all_prob_ins)), float(np.mean(all_prob_del))
+
+#     last_selected = all_selected_tubes[-1]
+#     last_scores = all_scores[-1]
+#     top_k = min(5, len(last_selected))
+#     fmt_scores = {t: f"{last_scores.get(t, 0):.4f}" for t in last_selected[:top_k]}
+ 
+#     log_experiment(args, log_func, ivd, question_text, ground_truth, model_answer, keywords, positions,
+#         prob_orig, prob_baseline_del, prob_baseline_ins, avg_prob_ins, avg_prob_del, 
+#         avg_auc_ins, avg_auc_del, std_auc_ins, std_auc_del, iou_score, num_runs,
+#         metrics, top_k, fmt_scores, fmt_scores, fmt_scores, 
+#         last_selected, last_selected, last_selected, unique_tubes, k_fraction, mode_name, start
+#     )
+
+#     return {
+#         "auc_ins": avg_auc_ins,
+#         "auc_del": avg_auc_del,
+#         "auc_ins_std": std_auc_ins,
+#         "auc_del_std": std_auc_del,
+#         "prob_orig": prob_orig,
+#         "prob_baseline_del": prob_baseline_del,
+#         "prob_baseline_ins": prob_baseline_ins,
+#         "prob_ins": avg_prob_ins,
+#         "prob_del": avg_prob_del,
+#         "iou_score": iou_score
+#     }
+
+
+# def explain_data(data, model, processor, args, tokenizer):
+#     """
+#     param data: pre-loaded list of data points (dict) - packed with get_data util
+#     param model: HF VLM model
+#     param processor: processor alongside the model
+#     param args: run arguments
+#     param tokenizer: "  "  alongside the model
+#     for each datapoint, runs XAI pipeline
+#     """
+#     now = datetime.datetime.now() 
+#     setting = f'{now.month}{now.day}-{now.hour}{now.minute}'
+#     out_dir = os.path.join(args.output_dir, setting)
+#     args.output_dir = out_dir
+#     os.makedirs(args.output_dir, exist_ok=True)
+#     with open(os.path.join(out_dir, 'args.json'), 'w') as f:
+#         json.dump(vars(args), f, indent=4)
+#     log_file = os.path.join(args.output_dir, "log.txt")
+    
+#     def log(msg):
+#         with open(log_file, "a") as f:
+#             f.write(str(msg) + "\n")
+            
+#     target_num_videos = min(len(data), args.num_videos) if args.num_videos > 0 else len(data)
+#     global_metrics = []
+#     global_gt_metrics = []
+    
+#     if args.randomize_data:
+#         random.shuffle(data)
+
+#     explained_count = 0
+#     for ivd in range(len(data)):
+#         if explained_count >= target_num_videos:
+#             break
+#         eprint(f"\nProcessing target {explained_count+1}/{target_num_videos} (Row {ivd}): Retrieving data.")
+#         start = time.time()
+
+#         try:
+#             frames, qs, cur_prompt, correct_idx = get_data(args, data[ivd])
+#             ground_truth_label = str(correct_idx)
+#             prompt = f"USER: {DEFAULT_VIDEO_TOKEN}\n{qs}. ASSISTANT:"
+#         except Exception as e:
+#             eprint(f"Error loading row {ivd}: {e}")
+#             continue
+            
+#         eprint(f"Retrieved data in {time.time() - start:.2f}s")
+
+#         input_ids, output_ids, output_text = get_model_response(args, model, processor, tokenizer, prompt, frames)
+#         special_ids = [idx for idx in [tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id] if idx is not None]
+#         full_ids = torch.cat((input_ids, output_ids), dim=1)
+
+#         eprint(f"{ivd+1}/{args.num_videos}: Creating Tubelets and Baseline Frames.")
+#         video_array, tubelets = generate_tubelets_optimized(frames, args)
+#         baseline_ins_arr = get_baseline_insertion(args, video_array)
+#         baseline_del_arr = get_baseline_deletion(args, video_array)
+#         baseline_ins_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_ins_arr]
+#         baseline_del_frames = [Image.fromarray(f.astype(np.uint8)) for f in baseline_del_arr]
+        
+#         PROB_DROP_THRESHOLD = 0.30
+#         if get_prob_drop(args, model, processor, full_ids, baseline_ins_frames, output_ids, frames, tokenizer) < PROB_DROP_THRESHOLD:
+#             eprint("Visual evidence too little. Skipping video")
+#             continue
+            
+#         metrics = explain_vid(
+#             args, model, processor, tokenizer, frames, video_array, tubelets, 
+#             baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, special_ids,
+#             input_ids, output_ids, full_ids, qs, ground_truth_label, output_text, output_text, ivd, log, 
+#             mode_name="STANDARD", file_prefix=""
+#         )
+
+#         global_metrics.append(metrics)
+
+#         if getattr(args, 'gt_forcing', False):    
+#             gt_ids = tokenizer(ground_truth_label, return_tensors='pt', add_special_tokens=False).input_ids.to(model.device)
+#             if gt_ids is not None:
+#                 gt_metrics = explain_vid(
+#                     args, model, processor, tokenizer, frames, video_array, tubelets, 
+#                     baseline_ins_arr, baseline_del_arr, baseline_ins_frames, baseline_del_frames, special_ids,
+#                     input_ids, gt_ids, qs, ground_truth_label, output_text, ground_truth_label, ivd, log, 
+#                     mode_name="GROUND TRUTH", file_prefix="gt_"
+#                 )
+#                 global_gt_metrics.append(gt_metrics)
+
+#         gc.collect()
+#         torch.cuda.empty_cache()
+#         explained_count+=1
+
+#     if global_metrics:
+#         all_prob_orig = [m["prob_orig"] for m in global_metrics]
+#         all_prob_del = [m["prob_del"] for m in global_metrics]
+#         dataset_faithfulness = calculate_faithfulness(all_prob_orig, all_prob_del)
+#         eprint(f"Faithfulness {dataset_faithfulness}")
+#         log_metrics(args, global_metrics)
+#     if global_gt_metrics:
+#         log_metrics(args, global_gt_metrics, prefix="GT-")
+
+#     eprint(f"\nExperiment Complete. Mean metrics saved to {args.output_dir}/final_metrics.json")

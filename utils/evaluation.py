@@ -13,7 +13,7 @@ from sklearn.metrics import auc
 
 from .logging import eprint
 from .model_utils import get_log_prob, get_score_direct
-from .preprocessing import get_baseline_deletion, get_baseline_insertion, apply_universal_mask
+from .preprocessing import get_baseline_deletion, get_baseline_insertion, apply_universal_mask, apply_continuous_mask
 
 
 
@@ -255,11 +255,12 @@ def get_p_normalized(p,p_baseline):
     """
     return (p - p_baseline) / (0 - p_baseline)
 
-def get_sufficency(p_original,p_mask_when_shown):
-    """assumes p_orig and p_mask are normalized locally"""
-    sufficiency = 1 - (p_orig - p_mask_when_shown)
-    #Clip to [0,1] to be safe
-    return max(0, min(sufficiency,1))
+def get_sufficiency(p_original, p_mask_when_shown):
+    """assumes p_original and p_mask are normalized locally"""
+    sufficiency = 1.0 - (p_original - p_mask_when_shown)
+    # Clip to [0,1] to be safe
+    return max(0.0, min(sufficiency, 1.0))
+
 
 def get_necessity(p_baseline, p_mask_when_deleted):
     """assumes p_baseline and p_mask are normalized locally"""
@@ -331,3 +332,65 @@ def jaccard_similarity_pixel(masks, top_k_fraction=0.10):
             else:
                 jaccard_scores.append(0.0)
         return float(np.mean(jaccard_scores))
+
+
+def evaluate_result(args, model_ctx, vid_ctx, selected_tubes, scores, num_runs=1):
+    """
+    Runs all metrics (AUC, Faithfulness, Monotonicity) and returns a dynamic dictionary.
+    
+    model_ctx: dict containing model, processor, tokenizer
+    vid_ctx: dict containing frames, ids, baseline arrays, tubelets, positions, etc.
+    """
+    model, processor, tokenizer = model_ctx['model'], model_ctx['processor'], model_ctx['tokenizer']
+    
+    # Calculate Base Probabilities
+    prob_orig = get_log_prob(args, model, processor, vid_ctx['full_ids'], vid_ctx['output_ids'], vid_ctx['frames'], vid_ctx['positions'], tokenizer)
+    prob_baseline_del = get_log_prob(args, model, processor, vid_ctx['full_ids'], vid_ctx['output_ids'], vid_ctx['baseline_del_frames'], vid_ctx['positions'], tokenizer)
+    prob_baseline_ins = get_log_prob(args, model, processor, vid_ctx['full_ids'], vid_ctx['output_ids'], vid_ctx['baseline_ins_frames'], vid_ctx['positions'], tokenizer)
+
+    # Calculate Continuous Mask Probabilities
+    frames_ins = apply_continuous_mask(vid_ctx['video_array'], vid_ctx['baseline_ins_arr'], vid_ctx['tubelets'], scores)
+    prob_ins = get_log_prob(args, model, processor, vid_ctx['full_ids'], vid_ctx['output_ids'], frames_ins, vid_ctx['positions'], tokenizer)
+    scores_del = {t: 1.0 - s for t, s in scores.items()}
+    frames_del = apply_continuous_mask(vid_ctx['video_array'], vid_ctx['baseline_del_arr'], vid_ctx['tubelets'], scores_del)
+    prob_del = get_log_prob(args, model, processor, vid_ctx['full_ids'], vid_ctx['output_ids'], frames_del, vid_ctx['positions'], tokenizer)
+
+    # AUC Metrics
+    auc_ins, auc_del = evaluate_auc(
+        args, model, processor, tokenizer, vid_ctx['full_ids'], vid_ctx['output_ids'], 
+        vid_ctx['frames'], vid_ctx['video_array'], vid_ctx['tubelets'], selected_tubes, 
+        vid_ctx['baseline_ins_arr'], vid_ctx['baseline_del_arr'], 
+        ivd=vid_ctx.get('ivd', 0), positions=vid_ctx['positions']
+    )
+
+    p_del_norm = get_p_normalized(prob_del, prob_baseline_ins)
+    p_ins_norm = get_p_normalized(prob_ins, prob_baseline_ins)
+    p_orig_norm = get_p_normalized(prob_orig, prob_baseline_ins)
+    p_baseline_norm = 0 #We assume this is the 'minimum score'
+    sufficiency = get_sufficiency(p_orig_norm, p_ins_norm)
+    necessity = get_necessity(p_baseline_norm, p_del_norm)
+
+    # Advanced Metrics
+
+    # local_faithfulness = calculate_local_faithfulness(prob_orig, prob_del, prob_baseline_del)
+    # monotonicity_score = calculate_monotonicity(
+    #     args, model, processor, tokenizer, vid_ctx['full_ids'], vid_ctx['output_ids'], 
+    #     vid_ctx['frames'], vid_ctx['video_array'], vid_ctx['tubelets'], vid_ctx['baseline_del_arr'], 
+    #     selected_tubes, vid_ctx['positions']
+    # )
+
+    # ANY metric added here is automatically handled by logging.py
+    metrics = {
+        "auc_ins": auc_ins,
+        "auc_del": auc_del,
+        "sufficiency": sufficiency,
+        "necessity": necessity,
+        "iou": 0.0,
+        "prob_orig": prob_orig,
+        "prob_ins": prob_ins,
+        "prob_del": prob_del,
+        "prob_baseline_del": prob_baseline_del,
+        "prob_baseline_ins": prob_baseline_ins,
+    }
+
+    return metrics
