@@ -67,6 +67,12 @@ def explain_vid(args, model_ctx, vid_ctx, meta_info):
         vid_ctx['baseline_ins_arr'], vid_ctx['baseline_del_arr'], vid_ctx['positions'], ivd
     )
 
+    if getattr(args, 'save_visuals', True):
+            eprint(f"{ivd+1}/{args.num_videos}: Saving Heatmap Visuals.")
+            file_prefix = "gt_" if meta_info['mode_name'] == "GROUND TRUTH" else ""
+            save_path = os.path.join(args.output_dir, f"{ivd}_{file_prefix}heatmap.gif")
+            visualize_heatmap(vid_ctx['video_array'], vid_ctx['tubelets'], scores, save_path)
+
     # Evaluation
     metrics = evaluate_result(args, model_ctx, vid_ctx, selected_tubes, scores, num_runs=1)
     # Logging 

@@ -16,15 +16,16 @@ def init_args():
     #SLIC clustering args (these are gnerally fine)
     parser.add_argument('--n_segments', type=int, default=120)
     parser.add_argument('--compactness', type=float, default=10.0)
+    parser.add_argument('--super_clusters', type=int, default=20)
     parser.add_argument('--cluster_temporal', type=lambda x: (str(x).lower() == 'true'), default=True)
     parser.add_argument('--cluster_mode', type=str, default='appearance', choices=['spatial', 'appearance'])
     #Optimizer
+    parser.add_argument('--use_bipop', type=lambda x: (str(x).lower() == 'true'), default=False)
     parser.add_argument('--iterations', type=int, default=15)
     parser.add_argument('--popsize', type=int, default=20)
+    parser.add_argument('--sigma_init', type=float, default=1.0)
     parser.add_argument('--use_hierarchical', type=lambda x: (str(x).lower() == 'true'), default=True)
     parser.add_argument('--mask_mode', type=str, default="joint", choices=["joint", "separate", "insertion", "deletion"])
-    #Super cluster args (if hierarchical)
-    parser.add_argument('--super_clusters', type=int, default=20)
     parser.add_argument('--freeze_losers', type=lambda x: (str(x).lower() == 'true'), default=False)
     #Similarity Experiment
     parser.add_argument('--k_fraction', type=float, default=0.25)
