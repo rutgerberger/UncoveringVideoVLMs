@@ -58,27 +58,61 @@ def explain_vid(args, model_ctx, vid_ctx, meta_info):
     )
     meta_info['keywords'] = keywords
     meta_info['positions'] = vid_ctx['positions']
+    num_runs = getattr(args, 'num_runs', 1)
+    if getattr(args, 'experiment', '') == 'similarity':
+        num_runs = max(num_runs, 10)
+
+    all_scores = []
+    all_metrics = []
 
     # Optimization Step
-    eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights")
-    selected_tubes, scores, _ = xai_method(
-        args, model, tokenizer, processor, vid_ctx['input_ids'], vid_ctx['output_ids'], 
-        vid_ctx['full_ids'], vid_ctx['frames'], vid_ctx['tubelets'], 
-        vid_ctx['baseline_ins_arr'], vid_ctx['baseline_del_arr'], vid_ctx['positions'], ivd
-    )
+    for run_idx in range(num_runs):
+        if num_runs > 1:
+            eprint(f"\n--- Consistency Run {run_idx+1}/{num_runs} ---")
+            seed = getattr(args, 'manual_seed', 42) + run_idx
+            np.random.seed(seed)
+            torch.manual_seed(seed)
 
-    if getattr(args, 'save_visuals', True):
+        eprint(f"{ivd+1}/{args.num_videos}: Optimizing Tubelet Weights (Run {run_idx+1})")
+        selected_tubes, scores, _ = xai_method(
+            args, model, tokenizer, processor, vid_ctx['input_ids'], vid_ctx['output_ids'], 
+            vid_ctx['full_ids'], vid_ctx['frames'], vid_ctx['tubelets'], 
+            vid_ctx['baseline_ins_arr'], vid_ctx['baseline_del_arr'], vid_ctx['positions'], ivd
+        )
+        
+        # Save visuals ONLY for the first run to prevent overwriting/spamming disk
+        if run_idx == 0 and getattr(args, 'save_visuals', True):
             eprint(f"{ivd+1}/{args.num_videos}: Saving Heatmap Visuals.")
             file_prefix = "gt_" if meta_info['mode_name'] == "GROUND TRUTH" else ""
             save_path = os.path.join(args.output_dir, f"{ivd}_{file_prefix}heatmap.gif")
             visualize_heatmap(vid_ctx['video_array'], vid_ctx['tubelets'], scores, save_path)
 
-    # Evaluation
-    metrics = evaluate_result(args, model_ctx, vid_ctx, selected_tubes, scores, num_runs=1)
-    # Logging 
-    log_experiment(args, meta_info, metrics, start_time=start)
+        # Evaluate and store this specific run
+        run_metrics = evaluate_result(args, model_ctx, vid_ctx, selected_tubes, scores, num_runs=num_runs)
+        all_scores.append(scores)
+        all_metrics.append(run_metrics)
 
-    return metrics
+    final_metrics = {}
+    for key in all_metrics[0].keys():
+        if isinstance(all_metrics[0][key], (int, float)):
+            vals = [m[key] for m in all_metrics]
+            final_metrics[key] = float(np.mean(vals))
+            if num_runs > 1:
+                final_metrics[f"{key}_std"] = float(np.std(vals, ddof=1))
+        else:
+            final_metrics[key] = all_metrics[-1][key] # Pass through non-numeric data
+
+    # Compute IoU over Tubelets
+    if num_runs > 1:
+        k_fraction = getattr(args, 'k_fraction', 0.25)
+        final_metrics['iou_score'] = jaccard_similarity(all_scores, top_k_fraction=k_fraction)
+    else:
+        final_metrics['iou_score'] = 1.0
+
+    log_experiment(args, meta_info, final_metrics, start_time=start)
+
+    return final_metrics
+
 
 def explain_data(data, model, processor, args, tokenizer):
     """

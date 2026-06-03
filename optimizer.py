@@ -1,5 +1,6 @@
 import os
 import gc
+import random
 
 import cma
 import numpy as np
@@ -61,18 +62,22 @@ def run_bipop_cmaes(mean_init, sigma_0, iters, popsize, args, evaluate_fn):
     """Runs the advanced BIPOP-CMA-ES multi-restart strategy."""
     eprint(f"--- Running with BIPOP-CMA-ES ---")
     
+    seed = getattr(args, 'manual_seed', 42)
+    if getattr(args, 'experiment') == 'similarity':
+        seed = random.randint(0,100)
+
     # fmin2 requires a function that returns a single scalar float (fitness)
     def objective_function(x):
         fitness, _, _ = evaluate_fn(x)
         return fitness
     
-    max_evals = iters * popsize * 5
+    max_evals = iters * popsize * 3
 
     options = {
         'maxiter': iters,
         'popsize': popsize,
         'bounds': [-5.0, 5.0],
-        'seed': getattr(args, 'manual_seed', 42),
+        'seed': seed,
         'verbose': -1,
         'maxfevals': max_evals
     }
@@ -92,8 +97,11 @@ def run_bipop_cmaes(mean_init, sigma_0, iters, popsize, args, evaluate_fn):
 
 def run_standard_cmaes(mean_init, sigma_0, iters, popsize, args, evaluate_fn):
     """Runs the standard step-by-step CMA-ES loop."""
+    seed = getattr(args, 'manual_seed', 42)
+    if getattr(args, 'experiment') == 'similarity':
+        seed = random.randint(0,100)
     es = cma.CMAEvolutionStrategy(mean_init, sigma_0, {
-        'maxiter': iters, 'popsize': popsize, 'bounds': [-5.0, 5.0], 'seed': getattr(args, 'manual_seed', 42)
+        'maxiter': iters, 'popsize': popsize, 'bounds': [-5.0, 5.0], 'seed': seed
     })
 
     generation = 0

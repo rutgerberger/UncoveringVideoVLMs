@@ -195,6 +195,11 @@ def get_score_direct(vid_input, model, args, full_ids, output_ids, dummy_inputs_
     """
     kwargs = _build_kwargs_direct(args, model, full_ids, vid_input, dummy_inputs_orig)
     target_logits = _get_target_logits(model, kwargs, output_ids)
+    if getattr(args, 'use_post_softmax', False):
+        log_probs_dist = F.log_softmax(target_logits, dim=-1)
+        target_log_probs = _gather_and_filter(log_probs_dist, output_ids, positions)
+        return target_log_probs.sum().item()
+
     raw_token_logits = _gather_and_filter(target_logits, output_ids, positions)
     if vocab_stats is not None:
         mus, sigmas = vocab_stats

@@ -27,6 +27,7 @@ def init_args():
     parser.add_argument('--use_hierarchical', type=lambda x: (str(x).lower() == 'true'), default=True)
     parser.add_argument('--mask_mode', type=str, default="joint", choices=["joint", "separate", "insertion", "deletion"])
     parser.add_argument('--freeze_losers', type=lambda x: (str(x).lower() == 'true'), default=False)
+    parser.add_argument('--use_post_softmax', type=lambda x: (str(x).lower() == 'true'), default=False)
     #Similarity Experiment
     parser.add_argument('--k_fraction', type=float, default=0.25)
 
