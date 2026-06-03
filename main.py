@@ -36,13 +36,19 @@ def xai_method(args, model, tokenizer, processor, input_ids, output_ids, full_id
     Returns the XAI method of preference (for testing)
     """
     method = getattr(args, 'method', 'cmaes')
+    if getattr(args, 'experiment', 'default') == 'random_baseline':
+        unique_tubes = np.unique(tubelets)
+        scores = {t: float(np.random.uniform(0, 1)) for t in unique_tubes}
+        selected_tubes = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
+        return selected_tubes, scores, {"status": "randomized"}
+
     if method == 'cmaes':
         return process_video(
             args, model, tokenizer, processor, output_ids, full_ids,
             frames, tubelets, baseline_ins_arr, baseline_del_arr, positions=positions
         )
     else:
-        return 0
+        return [], {}, {}
 
 def explain_vid(args, model_ctx, vid_ctx, meta_info):
     start = time.time()
